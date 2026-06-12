@@ -2,6 +2,7 @@
 In-Depth PRobabilistic Object-oriented Framework for Inundation Loss Estimation
 
 ## Structure of this repository
+```text
 In-Depth-PROFILE/
 ├── .gitignore                      <- For ignoring large datasets and temporary files/folders
 ├── LICENSE                         <- Specify the license of the repository
@@ -33,7 +34,10 @@ In-Depth-PROFILE/
     ├── 2026_Navaluenga_Draft.docx
     ├── Supplementary_Data.docx
     └── Figures_and_tables.docx
+```
 
 ## Notes:
-1-This repository and python code has not been designed as a python library neither as a fully automatic pip-line, rather as a worspace to use dynamicly on a code editor such as Visual Studio Code together with Conda environment. For example, python file 2_INSYDEPlus_Compiled_v3.py is executed up to a point, where the SHAPs values needs to be calculated using the file 3_Shapley_GSA_v3.1_... and 3_Shapley_GSA_v3.2_... Then the 2_INSYDEPlus_Compiled_v3.py code can be used to get the SHAP figure.
-2-Large files used in the process are ommited on this repository. Instead they are updated as part of the research on: ... (free download available)
+1. This repository and python code has not been designed as a python library neither as a fully automatic pip-line, rather as a worspace to use dynamicly on a code editor such as Visual Studio Code together with Conda environment. For example, python file
+2_INSYDEPlus_Compiled_v3.py is executed up to a point, where the SHAPs values needs to be calculated using the file 3_Shapley_GSA_v3.1_... and 3_Shapley_GSA_v3.2_... Then the 2_INSYDEPlus_Compiled_v3.py code can be used to get the SHAP figure.
+
+2. Large files used in the process are ommited on this repository. Instead they are updated as part of the research on: ... (free download available)
