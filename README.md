@@ -1,7 +1,7 @@
 # In-Depth-PROFILE
 In-Depth PRobabilistic Object-oriented Framework for Inundation Loss Estimation
 
-## Structure of this repository
+## Structure of this repository:
 ```text
 In-Depth-PROFILE/
 ├── .gitignore                      <- For ignoring large datasets and temporary files/folders
@@ -13,9 +13,9 @@ In-Depth-PROFILE/
 │   ├── User_Paths_and_Inputs.py    <- Centralized configuration and path management
 │   ├── 0_Web_Scraping_v2.py        <- Data extraction of economic data (Amazon/Wallapop)
 │   ├── 1_HEC-RAS_MonteCarlo_v4.py  <- Flood hazard modeling (HEC-RAS in Monte Carlo mode)
-│   ├── 2_INSYDEPlus_Compiled_v3.py <- Core code: includes data preprocessing, economic damage                                         Monte Carlo and data post-processing
+│   ├── 2_INSYDEPlus_Compiled_v3.py <- Core code: includes data preprocessing, economic damage Monte Carlo and data post-processing
 │   ├── 3_Shapley_GSA_v3.1_PrepareDataset.py <- Data prep for sensitivity analysis
-│   └── 3_Shapley_GSA_v3.2_SHAP.py  <- XGBoost training and SHAP value calculation (use a                                              different environment)
+│   └── 3_Shapley_GSA_v3.2_SHAP.py  <- XGBoost training and SHAP value calculation (use a different environment)
 │
 ├── data/                           <- Data directory (tracked files only; large files ignored)
 │   ├── raw/                        <- E.g., survey data, uncorrected DSMs
