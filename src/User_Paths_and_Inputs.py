@@ -4,7 +4,9 @@ Both input and output paths
 '''
 import os
 
-workspace = r"C:\Users\outal\OneDrive\3_Personas y Proyectos\Jose - UCLM\2_Economic Valuation\PyWS"
+# Set the workspace to the parent directory (In-Depth-PROFILE/)
+script_dir = os.path.dirname(os.path.abspath(__file__))
+workspace = os.path.dirname(script_dir)
 os.chdir(workspace)
 
 ### PATHS
