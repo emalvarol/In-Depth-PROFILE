@@ -52,7 +52,7 @@ class HydrologicalFitter:
         Initializes the fitter with centralized framework paths.
         """
         self.paths = config_paths
-        self.output_path = self.paths['fm_flow_xlsx']
+        self.output_path = self.paths['fm_pkl']
 
     @staticmethod
     def _fit_pearson3(x_vals, tail_percentile=0.05):
@@ -99,7 +99,8 @@ class HydrologicalFitter:
         
         # Dynamic directory creation and export using pathlib
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        dist_depth_df.to_excel(self.output_path, index=False)
+        dist_depth_df.to_pickle(self.output_path)
+        
         print(f"Hydrological distribution mapping exported successfully to: {self.output_path}")
         
         return dist_depth_df
@@ -335,7 +336,7 @@ class HecRasMonteCarloEngine:
         print("--------------------------------------------\n")
         print("--------------------------------------------\n")
         gdf_buildings = gpd.read_file(self.paths['buildings_sample_med_shp'])
-        dist_depth_df = pd.read_excel(self.paths['fm_flow_xlsx'])
+        dist_depth_df = pd.read_pickle(self.paths['fm_flow_pkl'])
         pkl_path = self.paths['depth_samples_pkl']
 
         for rp_key in sorted(self.return_periods.keys(), reverse=True):

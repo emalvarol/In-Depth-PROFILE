@@ -83,6 +83,8 @@ pip install ras_commander==0.89.2 thefuzz==0.22.1 playwright
 
 4. Install navigator for web scrapping:
 playwright install
+
+5.  Add environment to exception in Windows Security
 ```
 
 ### Environment B
