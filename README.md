@@ -83,39 +83,6 @@ pip install ras_commander==0.89.2 thefuzz==0.22.1 playwright
 
 4. Install navigator for web scrapping:
 playwright install
-
-5. (if warning with GDAL) Ensure GDAL will work well setting the PATHS
-on "anaconda prompt":
-conda env config vars set GDAL_DATA="C:\Users\<Your_User>\envs\env_a\Library\share\gdal"
-conda env config vars set PROJ_DATA="C:\Users\<Your_User>\envs\env_a\Library\share\proj"
-conda deactivate
-conda activate env_a+
-... or on "cmd":
-setx GDAL_DATA "C:\Users\<Your_User>\envs\env_a\Library\share\gdal"
-setx PROJ_DATA "C:\Users\<Your_User>\envs\env_a\Library\share\proj"
-
-5b. (if warning with GDAL & you work inside VSC) Ensure GDAL will work well setting the PATHS on VSC
-click "Ctrl + ," and open the icon in the top right corner "Open Settings (JSON)" and add:
-"terminal.integrated.env.windows": {
-    "GDAL_DATA": "C:\\Users\\<Your_User>3\\envs\\env_a\\Library\\share\\gdal",
-    "PROJ_DATA": "C:\\Users\\<Your_User>3\\envs\\env_a\\Library\\share\\proj"
-},
-"python.envFile": "${workspaceFolder}/.env"
-
-6. (if problems with c++) Add environment as an exception for windows defender to avoid problems with
-libraries that use c++
-sear and open "Windows Security" > click on "Virus & threat protection" > click on "Manage settings" under "Virus & threat protection settings" > click on "Add or remove exclusions" under "Exclusions" > click on "Add an exclusion", select "folder" and navigate to the environment path "C:\Users\<Your_User>\anaconda3\envs\env_a". Note you might need to restart your computer.
-
-7. (if problems with DLL) Add AppLocker exceptions rules for DLL:
-open "cmd" and run "secpol.msc" > navigate to "Security Settings > Application Control Policies > AppLocker" > right click on "AppLocker" and select "Properties" > in the advance tab check "Enable the DLL rule collection" and apply (a new "DLL Rules" folder will appear under AppLocker) > click on "DLL Rules" > on the empty right-hand panel select "Create New Rule..." with right click > click on "Next > Allow > Path" and write "C:\Users\<Your_User>\anaconda3\envs\env_a\* > click on "Next" and as name set "Allow Conda Env DLLs" > finally open "cmd" and forze "gpupdate /force".
-
-Extra: If you need to unistall the environment:
-conda deactivate
-... and:
-conda env remove --prefix C:\ProgramData\anaconda3\envs\env_a
-... or:
-conda env remove --name env_a
-
 ```
 
 ### Environment B
