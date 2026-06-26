@@ -1,0 +1,32 @@
+<VRTDataset rasterXSize="718" rasterYSize="588">
+  <SRS dataAxisToSRSAxisMapping="1,2">PROJCS["ETRS89 / UTM zone 30N",GEOGCS["ETRS89",DATUM["European_Terrestrial_Reference_System_1989",SPHEROID["GRS 1980",6378137,298.257222101,AUTHORITY["EPSG","7019"]],TOWGS84[0,0,0,0,0,0,0],AUTHORITY["EPSG","6258"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]],AUTHORITY["EPSG","4258"]],PROJECTION["Transverse_Mercator"],PARAMETER["latitude_of_origin",0],PARAMETER["central_meridian",-3],PARAMETER["scale_factor",0.9996],PARAMETER["false_easting",500000],PARAMETER["false_northing",0],UNIT["metre",1,AUTHORITY["EPSG","9001"]],AXIS["Easting",EAST],AXIS["Northing",NORTH],AUTHORITY["EPSG","25830"]]</SRS>
+  <GeoTransform>  3.5490482198139559e+05,  1.0000000000000000e+00,  0.0000000000000000e+00,  4.4747680400000000e+06,  0.0000000000000000e+00, -1.0000000000000000e+00</GeoTransform>
+  <VRTRasterBand dataType="Float32" band="1">
+    <Metadata>
+      <MDI key="STATISTICS_MAXIMUM">752.17236328125</MDI>
+      <MDI key="STATISTICS_MEAN">751.29026237293</MDI>
+      <MDI key="STATISTICS_MINIMUM">748.33941650391</MDI>
+      <MDI key="STATISTICS_STDDEV">0.76391685262412</MDI>
+    </Metadata>
+    <NoDataValue>-9999</NoDataValue>
+    <ColorInterp>Gray</ColorInterp>
+    <Histograms>
+      <HistItem>
+        <HistMin>748.339416503906</HistMin>
+        <HistMax>752.17236328125</HistMax>
+        <BucketCount>256</BucketCount>
+        <IncludeOutOfRange>1</IncludeOutOfRange>
+        <Approximate>0</Approximate>
+        <HistCounts>3|5|6|8|20|26|25|28|33|31|32|23|27|30|30|29|27|32|31|23|25|14|26|17|27|17|28|16|34|14|38|9|39|23|26|33|17|35|31|19|38|36|34|32|29|34|35|29|28|31|32|33|35|38|41|41|45|42|47|46|50|48|48|51|54|51|53|55|55|54|59|52|52|49|48|51|52|49|47|47|44|44|46|45|45|44|43|43|41|43|45|45|46|46|47|48|49|47|43|47|41|37|37|36|35|30|32|32|28|31|31|29|29|31|30|37|33|38|39|43|55|56|60|67|65|66|86|101|112|119|123|116|101|93|97|99|79|89|90|91|92|89|91|90|109|126|143|161|166|160|153|136|123|120|117|104|99|88|85|81|81|80|83|89|93|86|94|110|126|138|161|181|213|633|430|350|346|390|429|467|540|547|525|513|671|2034|592|502|471|438|418|372|366|338|324|298|280|260|254|219|238|240|252|251|275|322|249|223|231|270|316|300|273|290|410|449|390|417|2539|695|436|398|391|396|419|403|517|423|379|362|367|391|406|458|496|392|374|441|478|802|775|782|947|3185|801|590|499|440|418|379|361|331|288|312|409|813</HistCounts>
+      </HistItem>
+    </Histograms>
+    <ComplexSource>
+      <SourceFilename relativeToVRT="1">WSE (Max).Terrain.dsm_cs1_v23.tif</SourceFilename>
+      <SourceBand>1</SourceBand>
+      <SourceProperties RasterXSize="718" RasterYSize="588" DataType="Float32" BlockXSize="256" BlockYSize="256" />
+      <SrcRect xOff="0" yOff="0" xSize="718" ySize="588" />
+      <DstRect xOff="0" yOff="0" xSize="718" ySize="588" />
+      <NODATA>-9999</NODATA>
+    </ComplexSource>
+  </VRTRasterBand>
+</VRTDataset>

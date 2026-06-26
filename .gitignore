@@ -1,1 +1,17 @@
+# VSC related folders and files
+.vscode/
 
+# Python byte-code and caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Office temporary files
+~$*.xlsx
+~$*.xls
+
+# Ignore all production datasets completely (to heavy, uploaded in other platform)
+data/**
+models/**
+outputs/**

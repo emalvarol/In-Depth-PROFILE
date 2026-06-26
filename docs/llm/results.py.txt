@@ -1,0 +1,1158 @@
+"""
+In-Depth-PROFILE Plotting and Results Visualization Module
+This module encapsulates all helper analytical parsing functions, data preparation
+routines, and vectorized visualization components to render figures, maps, and tables
+for flood loss estimation and global sensitivity analyses.
+"""
+
+import os
+import re
+import math
+from pathlib import Path
+from functools import partial
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+from shapely.geometry import Polygon
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import matplotlib.patheffects as pe
+import matplotlib.patches as patches
+import matplotlib.lines as lines
+import matplotlib.ticker as ticker
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+
+class shap_results_grouper:
+    def __init__(self, columns, separator="|"):
+        self.separator = separator
+        self.columns_state = [str(col).split(self.separator) for col in columns]
+
+    def print_unique_names(self, level_index):
+        unique_groups = set()
+        for col_levels in self.columns_state:
+            if level_index < len(col_levels):
+                unique_groups.add(col_levels[level_index])
+        print(f"{len(unique_groups)} groups found")
+        print(f"Unique groups at Level {level_index}:", sorted(list(unique_groups)))
+
+    def remove_all_levels(self):
+        for i, col_levels in enumerate(self.columns_state):
+            self.columns_state[i] = [col_levels[0]]
+
+    def add_level(self, rules, default="Unclassified"):
+        for i, col_levels in enumerate(self.columns_state):
+            base_name = col_levels[0]
+            new_group = default
+            
+            if callable(rules):
+                new_group = rules(base_name)
+            elif isinstance(rules, dict):
+                for pattern, group_name in rules.items():
+                    if pattern == base_name or (isinstance(pattern, str) and re.search(pattern, base_name)):
+                        new_group = group_name
+                        break
+                        
+            self.columns_state[i].append(new_group)
+
+    def update_dataframe(self, df):
+        df.columns = [self.separator.join(col_levels) for col_levels in self.columns_state]
+        return df
+
+class ResultsVisualizer:
+    """
+    Handles figure creation from In-Depth-PROFILE results.
+    """
+    
+    def __init__(self, config_paths, config_codes, config_return_periods):
+        """Initializes the visualizer with framework metadata and single-source truth catalogs."""
+        self.paths = config_paths
+        self.codes = config_codes
+        self.return_periods = config_return_periods
+        
+        # Single Source of Truth Style Configuration
+        self.global_pre_style = {
+            'font.family': 'serif',
+            'font.serif': ['Times New Roman'],
+            'mathtext.fontset': 'cm',
+            'axes.unicode_minus': False,
+            'font.size': 8,
+            'axes.labelsize': 8,
+            'xtick.labelsize': 8,
+            'ytick.labelsize': 8,
+            'legend.fontsize': 8,
+            'figure.titlesize': 8,
+            'axes.grid': True,
+            'grid.alpha': 0.3,
+            'grid.linestyle': '--',
+            'legend.frameon': False,
+            'axes.spines.top': False,
+            'axes.spines.right': False,
+        }
+        
+        # Return Period Mapping
+        rps = list(config_return_periods.keys())
+        cmap_rp = plt.get_cmap('viridis', len(rps))
+        self.rp_colors = {rp: cmap_rp(i) for i, rp in enumerate(rps)}
+        self.rp_indices = range(len(rps))
+        
+        # Floodplain Contours Mapping
+        self.q_colors = {
+            'sto_Q05_contour': "#0084FF",
+            'sto_Q50_contour': "#2F00FF",
+            'det_Q50_contour': "#16B302",
+            'sto_Q95_contour': "#6F00FF",
+        }
+        
+        # Sensitivity Analysis Core Mapping Tracker
+        self.gsa_group_colors = {
+            'he': "#ff0000",
+            'Structure': "#ff7300",
+            'GL': "#ca5b01ff",
+            'BH': "#a86936",
+            'IH': "#632d01",
+            'Cga': "#fc913a",
+            'C.High': "#00ff0d",
+            'Prices': "#00f7ff",
+            'Objects': "#4c00ff",
+            'ed': "#ae00ff",
+            'Materials': "#ff0095",
+            'Content': "#9293ce",
+            'Continent': "#c992ce",
+        }
+        
+        # Maps
+        self.dst_crs = 'EPSG:4326'
+    
+    def calc_hr_convergence(self, df, rp_key, threshold=0.1, z_score=1.96):
+        """
+        Calculates convergence metrics for a specific Return Period.
+        Criteria: SN > 30, IRME == 0, and 30 consecutive stable steps.
+        """
+        rp_df = df[df['RP'] == rp_key].copy()
+        
+        if rp_df.empty:
+            return False, rp_df
+
+        rp_df = rp_df.sort_values(by=['BID', 'SN'])
+
+        rp_df['he_BID_sn'] = rp_df.groupby('BID')['he'].transform(lambda x: x.expanding().mean())
+        rp_df['SD_BID_sn'] = rp_df.groupby('BID')['he'].transform(lambda x: x.expanding().std(ddof=1))
+        rp_df['SE_BID_sn'] = rp_df['SD_BID_sn'] / np.sqrt(rp_df['SN'])
+        rp_df['ME_BID_sn'] = z_score * rp_df['SE_BID_sn']
+        rp_df['Residual'] = (rp_df['ME_BID_sn'] - threshold).clip(lower=0)
+        
+        rp_df['MET_BID'] = (rp_df['SN'] > 30) & (rp_df['Residual'] == 0)
+        
+        blocks = (~rp_df['MET_BID']).groupby(rp_df['BID']).cumsum()
+        rp_df['STC_BID'] = rp_df.groupby(['BID', blocks]).cumcount() * rp_df['MET_BID']
+        rp_df['CONV_BID'] = rp_df['STC_BID'] >= 30
+        
+        rp_simp = rp_df.groupby('SN').agg(
+            IRME=('Residual', 'sum'),
+            NON_CONV_COUNT=('Residual', lambda x: (x > 0).sum())
+        ).reset_index()
+
+        total_flooded_bids = rp_df[rp_df['he'] > 0]['BID'].nunique()
+        if total_flooded_bids > 0:
+            rp_simp['REL_NON_CONV'] = (rp_simp['NON_CONV_COUNT'] / total_flooded_bids) * 100
+        else:
+            rp_simp['REL_NON_CONV'] = 0.0
+
+        rp_simp['MET'] = (rp_simp['SN'] > 30) & (rp_simp['IRME'] == 0)
+
+        blocks = (~rp_simp['MET']).cumsum()
+        rp_simp['STC_AG'] = rp_simp.groupby(blocks).cumcount() * rp_simp['MET']
+        rp_simp['CONV'] = rp_simp['STC_AG'] >= 30
+
+        if not rp_simp.empty:
+            is_converged = rp_simp['CONV'].iloc[-1]
+            return bool(is_converged), rp_simp, rp_df
+        
+        return False, rp_simp
+
+    def calc_vats_convergence(self, df, n_sims, n_start=500, calc_step=500, n_step_check=3, 
+                              alphas=[50, 10, 5, 1], epsilons=[25, 20, 10, 5, 1], cores=4):
+        """
+        Extended Vats et al. (2019) multivariate stopping rule for multiple buildings.
+        """
+        import multiprocess
+        
+        RPs_vats = np.sort(df['RP'].unique())
+        cost_cols = [c for c in df.columns if c.startswith('c_')]
+        expected_sns_full = np.arange(1, n_sims + 1)
+        
+        final_results = []
+        detailed_results = []
+        execution_logs = []
+        
+        process_func = partial(_process_bid_worker, alphas=alphas, epsilons=epsilons)
+        
+        for rp in RPs_vats:
+            df_rp = df[df["RP"] == rp]
+            BIDs_vats_rp = np.sort(df_rp['BID'].unique())
+            total_rp_bids = len(BIDs_vats_rp)
+            consecutive_convergence = {bid: 0 for bid in BIDs_vats_rp}
+            active_bids = set(BIDs_vats_rp)
+            
+            grouped = df_rp.groupby("BID")
+            bid_matrices = {
+                bid: (
+                    group.set_index("SN")
+                    .reindex(expected_sns_full, fill_value=0.0)[cost_cols]
+                    .values.astype(np.float64)
+                )
+                for bid, group in grouped if bid in BIDs_vats_rp
+            }
+            
+            with multiprocess.Pool(processes=cores) as pool:
+                steps = list(range(n_start, n_sims + 1, calc_step))
+                if not steps or steps[-1] < n_sims: 
+                    steps.append(n_sims)
+                    
+                for n in steps:
+                    if not active_bids:
+                        break
+                    
+                    args_list = [(bid_matrices[bid][:n], bid, n) for bid in active_bids]
+                    outputs = pool.map(process_func, args_list)
+
+                    step_metrics = {}
+                    new_active_bids = []
+                    
+                    for out in outputs:
+                        if out["logs"]:
+                            execution_logs.extend(out["logs"])
+                            
+                        if out["status"] in ("skipped", "error"):
+                            new_active_bids.append(out["bid"])
+                            continue
+
+                        detailed_row = {
+                            "RP": rp, "SN": n, "BID": out["bid"], "status": out["status"]
+                        }
+                        detailed_row.update(out["residuals"])
+                        detailed_row.update(out["active_counts"])
+                        detailed_results.append(detailed_row)
+                        
+                        for k, v in out["residuals"].items():
+                            step_metrics[k] = step_metrics.get(k, 0.0) + v
+                        for k, v in out["active_counts"].items():
+                            step_metrics[k] = step_metrics.get(k, 0) + v
+                        
+                        if out["status"] == "converged":
+                            consecutive_convergence[out["bid"]] += 1
+                        else:
+                            consecutive_convergence[out["bid"]] = 0
+                            
+                        if consecutive_convergence[out["bid"]] < n_step_check:
+                            new_active_bids.append(out["bid"])
+
+                    row = {
+                        "RP": rp, "SN": n, "total_rp_bids": total_rp_bids,
+                        "any_active_bids": len(new_active_bids) 
+                    }
+                    row.update(step_metrics)
+                    final_results.append(row)
+                    active_bids = set(new_active_bids)
+                    
+        return pd.DataFrame(final_results), pd.DataFrame(detailed_results), execution_logs
+
+    def plot_any(self, dict_to_plot, layout_params, save_params, global_pre_style=None, global_style=None):
+        """Populates multi-panel mosaic or standard grid structures dynamically via configured dictionaries."""
+        def get_kwargs(data_dict, exclude_keys):
+            internal_keys = {'plot_type', 'style_type', 'legend_type', 'gstype'}
+            to_exclude = set(exclude_keys) | internal_keys
+            return {k: v for k, v in data_dict.items() if k not in to_exclude}
+        
+        def _check_required_keys(params, required, ptype, ax_key):
+            if not all(k in params for k in required):
+                raise KeyError(f"Axis '{ax_key}': '{ptype}' requires {required} keys.")
+        
+        style_config = global_pre_style if global_pre_style is not None else self.global_pre_style
+        plt.rcParams.update(style_config)
+
+        layout = layout_params.get('layout', '1x1')
+        figsize = layout_params.get('figsize', (4, 4))
+        mosaic = layout_params.get('mosaic_structure')
+        squared = layout_params.get('squared', False)
+        kwargs = layout_params.get('kwargs', {})
+
+        if layout == "mosaic":
+            if mosaic is None:
+                raise ValueError("mosaic_structure required for mosaic layout.")
+            fig, ax_dict = plt.subplot_mosaic(mosaic, figsize=figsize, **kwargs)
+        else:
+            rows, cols = map(int, layout.split('x'))
+            fig, axs = plt.subplots(rows, cols, figsize=figsize, **kwargs)
+            if isinstance(axs, np.ndarray):
+                ax_dict = {i: a for i, a in enumerate(axs.flatten())}
+            else:
+                ax_dict = {0: axs}
+
+        if squared:
+            for a in ax_dict.values():
+                a.set_box_aspect(1)
+        
+        if 'adjust' in layout_params:
+            fig.subplots_adjust(**layout_params['adjust'])
+        
+        for key, config in dict_to_plot.items():
+            if key not in ax_dict:
+                continue
+            ax = ax_dict[key]
+            
+            # Draw individual plot footprints
+            for p in config.get('plots', []):
+                ptype = p.get('plot_type')
+                if ptype == 'line':
+                    _check_required_keys(p, ['x', 'y'], 'line', key)
+                    ax.plot(p['x'], p['y'], **get_kwargs(p, ['x', 'y']))
+                elif ptype == 'barh':
+                    _check_required_keys(p, ['y', 'width'], 'barh', key)
+                    ax.barh(y=p['y'], width=p['width'], **get_kwargs(p, ['y', 'width']))
+                elif ptype == 'barv':
+                    _check_required_keys(p, ['x', 'height'], 'barv', key)
+                    ax.bar(x=p['x'], height=p['height'], **get_kwargs(p, ['x', 'height']))
+                elif ptype == 'hist':
+                    _check_required_keys(p, ['dataset'], 'hist', key)
+                    ax.hist(p['dataset'], **get_kwargs(p, ['dataset']))
+                elif ptype == 'vline':
+                    _check_required_keys(p, ['x'], 'vline', key)
+                    ax.axvline(x=p['x'], **get_kwargs(p, ['x']))
+                elif ptype == 'hline':
+                    _check_required_keys(p, ['y'], 'hline', key)
+                    ax.axhline(y=p['y'], **get_kwargs(p, ['y']))
+                elif ptype == 'fill':
+                    _check_required_keys(p, ['x', 'y1', 'y2'], 'fill', key)
+                    ax.fill_between(x=p['x'], y1=p['y1'], y2=p['y2'], **get_kwargs(p, ['x', 'y1', 'y2']))
+                elif ptype == 'scatter':
+                    _check_required_keys(p, ['x', 'y'], 'scatter', key)
+                    ax.scatter(p['x'], p['y'], **get_kwargs(p, ['x', 'y']))
+                elif ptype == 'text':
+                    _check_required_keys(p, ['x', 'y', 'text'], 'text', key)
+                    trans = p.get('transform', ax.transAxes)
+                    if trans == 'data': trans = ax.transData
+                    ax.text(p['x'], p['y'], p['text'], transform=trans, **get_kwargs(p, ['x', 'y', 'text', 'transform']))
+                elif ptype == 'gdf_shp':
+                    _check_required_keys(p, ['gdf'], 'gdf_shp', key)
+                    p['gdf'].plot(ax=ax, **get_kwargs(p, ['gdf']))
+                elif ptype == 'imshow':
+                    _check_required_keys(p, ['image', 'extent'], 'imshow', key)
+                    ax.imshow(p['image'], extent=p['extent'], origin='upper', **get_kwargs(p, ['image', 'extent', 'origin']))
+                elif ptype == 'sankey':
+                    import matplotlib.patches as patches
+                    from matplotlib.path import Path
+
+                    _check_required_keys(p, ['nodes', 'links'], 'sankey', key)
+                    
+                    nodes_list = p['nodes'] 
+                    links_list = p['links'] 
+                    
+                    # 1. Draw the connection streams (Links) using Bezier paths
+                    for link in links_list:
+                        # FIX: Correctly extract the individual dictionary node using its integer ID
+                        src = nodes_list[link['source']]
+                        tgt = nodes_list[link['target']]
+                        
+                        x0, y0 = src['x'], link.get('src_y', src['y'])
+                        x1, y1 = tgt['x'], link.get('tgt_y', tgt['y'])
+                        
+                        w_src = link.get('value_src', link.get('value', 0))
+                        w_tgt = link.get('value_tgt', link.get('value', 0))
+                        
+                        cx0 = x0 + (x1 - x0) / 2
+                        cx1 = x1 - (x1 - x0) / 2
+                        
+                        verts = [
+                            (x0, y0),         # Start bottom-left
+                            (cx0, y0), (cx1, y1), (x1, y1),  # Forward curve (bottom edge)
+                            (x1, y1 + w_tgt), # Move up right side
+                            (cx1, y1 + w_tgt), (cx0, y0 + w_src), (x0, y0 + w_src), # Backward curve (top edge)
+                            (x0, y0)          # Close loop
+                        ]
+                        
+                        codes = [
+                            Path.MOVETO,
+                            Path.CURVE4, Path.CURVE4, Path.CURVE4,
+                            Path.LINETO,
+                            Path.CURVE4, Path.CURVE4, Path.CURVE4,
+                            Path.CLOSEPOLY
+                        ]
+                        
+                        ax.add_patch(patches.PathPatch(
+                            Path(verts, codes), 
+                            facecolor=link.get('color', '#cccccc'), 
+                            alpha=link.get('alpha', 0.4), 
+                            edgecolor='none'
+                        ))
+                    
+                    # 2. Draw the vertical blocks (Nodes)
+                    for node in nodes_list:
+                        ax.add_patch(patches.Rectangle(
+                            (node['x'] - p.get('node_width', 0.02), node['y']),
+                            p.get('node_width', 0.02) * 2,
+                            node['h'],
+                            facecolor=node.get('color', '#555555'),
+                            edgecolor=node.get('edgecolor', 'none'),
+                            alpha=node.get('alpha', 1.0)
+                        ))
+                        
+                        if node['h'] < 0.005:
+                            continue
+                            
+                        if node['x'] < 0.2:
+                            ha_dir = 'right'
+                            offset = -0.025
+                        elif node['x'] > 0.8:
+                            ha_dir = 'left'
+                            offset = 0.025
+                        else:
+                            ha_dir = 'center'
+                            offset = 0.0
+                            
+                        y_pos = node['y'] + node['h']/2 if ha_dir != 'center' else node['y'] + node['h'] + 0.01
+                        
+                        ax.text(
+                            node['x'] + offset, y_pos, node['name'], 
+                            va='center', ha=ha_dir, fontsize=p.get('fontsize', 8)
+                        )
+
+            # Apply localized styles
+            for s in config.get('style', []):
+                stype = s.get('style_type')
+                if stype in ['xlabel', 'ylabel', 'title']:
+                    getattr(ax, f'set_{stype}')(s.get('label', ''), **get_kwargs(s, ['label']))
+                elif stype in ['xlim', 'ylim', 'xscale', 'yscale']:
+                    getattr(ax, f'set_{stype}')(**get_kwargs(s, []))
+                elif stype in ['xticks', 'yticks']:
+                    getattr(ax, f'set_{stype}')(s.get('ticks', []), **get_kwargs(s, ['ticks']))
+                elif stype in ['xticklabels', 'yticklabels']:
+                    getattr(ax, f'set_{stype}')(s.get('labels', []), **get_kwargs(s, ['labels']))
+                elif stype == 'grid':
+                    ax.grid(**get_kwargs(s, []))
+                elif stype == 'off':
+                    ax.axis('off')
+                elif stype == 'letter':
+                    ax.text(s.get('x', 0.02), s.get('y', 0.95), s.get('label', ''), transform=ax.transAxes, fontweight=s.get('fontweight', 'bold'), va='top', ha='left')
+                elif stype == 'major_formatter':
+                    axis_obj = ax.xaxis if s.get('axis') == 'x' else ax.yaxis
+                    if s.get('formatter_type') == 'dms_suffix':
+                        suffix = s.get('suffix', '')
+                        def format_dms(value, pos):
+                            abs_val = abs(value)
+                            deg = int(abs_val)
+                            min_float = (abs_val - deg) * 60
+                            minutes = int(min_float)
+                            seconds = round((min_float - minutes) * 60)
+                            return f"{deg:g}º{minutes:02d}'{seconds:02d}''{suffix}"
+                        axis_obj.set_major_formatter(ticker.FuncFormatter(format_dms))
+
+            # Render legends and labels
+            for l in config.get('legend', []):
+                ltype = l.get('legend_type')
+                if ltype == 'text':
+                    ax.text(l['x'], l['y'], l['content'], transform=ax.transAxes, **get_kwargs(l, ['x', 'y', 'content']))
+                elif ltype == 'rectangle':
+                    ax.add_patch(patches.Rectangle((l['x'], l['y']), l['width'], l['height'], color=l['color'], transform=ax.transAxes, clip_on=False))
+
+        if global_style:
+            for s in global_style:
+                if s.get('gstype') in ['suptitle', 'supxlabel', 'supylabel']:
+                    getattr(fig, s.get('gstype'))(s.get('label', ''), **get_kwargs(s, ['label']))
+
+        path = os.path.join(save_params.get('output_dir', '.'), save_params.get('subfolder', ''))
+        if not os.path.exists(path): 
+            os.makedirs(path)
+        if save_params.get('tight_layout', False): 
+            fig.tight_layout()
+        fig.savefig(os.path.join(path, save_params.get('fname', 'plot.png')), bbox_inches='tight', dpi=save_params.get('dpi', 300))
+        if save_params.get('show', True): plt.show()
+        else: plt.close()
+        return fig, ax_dict
+
+    def init_dic(self, dict_to_plot, ax, key):
+        """Initializes empty metadata sub-containers safely within target configurations."""
+        if ax not in dict_to_plot:
+            dict_to_plot[ax] = {}
+        dict_to_plot[ax][key] = []
+
+    def get_ax_ratio(self, layout_params, ax):
+        """Calculates the physical window aspect bounding-box ratio of a designated layout canvas."""
+        fig, ax_dict = plt.subplot_mosaic(layout_params['mosaic_structure'], figsize=layout_params['figsize'], **layout_params.get('kwargs', {}))
+        fig.subplots_adjust(**layout_params.get('adjust', {}))
+        plt.draw() 
+        bbox = ax_dict[ax].get_window_extent()
+        real_ratio = bbox.width / bbox.height
+        plt.close(fig)
+        return real_ratio
+
+    def calc_map_extent(self, top_left_x, top_left_y, zoom_pct, real_ratio, base_span=0.02):
+        """Transforms degree minute coordinates into geographic coordinate system map bounds."""
+        xmin = -(top_left_x[0] + top_left_x[1]/60 + top_left_x[2]/3600)
+        ymax = (top_left_y[0] + top_left_y[1]/60 + top_left_y[2]/3600)
+        width = base_span * (zoom_pct / 100)
+        height = width / real_ratio 
+        return [xmin, xmin + width, ymax - height, ymax]
+
+    def simplify_flood_contour(self, shp):
+        """Dissolves interiors and eliminates micro-scale polygon slivers from inundation layer sheets."""
+        shp = shp.explode(index_parts=False)
+        shp.geometry = shp.geometry.apply(lambda poly: Polygon(poly.exterior) if poly.interiors else poly)
+        shp = shp[shp.geometry.area > 1e-7]
+        union_geom = shp.union_all()
+        simplified = union_geom.simplify(tolerance=0.0001, preserve_topology=True)
+        return gpd.GeoDataFrame(geometry=[simplified], crs="EPSG:4326")
+
+    def get_dx_for_scalebar(self, extent, crs='EPSG:4326'):
+        """Calculates physical conversion factors per data coordinate unit for map scalebars."""
+        if crs == 'EPSG:4326':
+            mid_lat = (extent[2] + extent[3]) / 2
+            return (math.pi / 180.0) * 6378137.0 * math.cos(math.radians(mid_lat))
+        return 1.0
+
+    def create_2_linear_ax_scale(self, max_val, split, pct):
+        """Builds forwarding/reversing structural mappings for segmented axis stretching."""
+        fwd = lambda x: np.where(x <= split, (pct / split) * x, pct + ((1.0 - pct) / (max_val - split)) * (x - split))
+        rev = lambda y: np.where(y <= pct, (split / pct) * y, split + ((max_val - split) / (1.0 - pct)) * (y - pct))
+        return (fwd, rev)
+
+    def create_3_linear_ax_scale(self, max_val, split1, split2, pct1, pct2):
+        """Constructs three-segment piecewise scales to zoom axis sub-segments."""
+        def forward_scale(x):
+            x = np.asarray(x, dtype=float)
+            conds = [x <= split1, (x > split1) & (x <= split2), x > split2]
+            funcs = [(pct1 / split1) * x, pct1 + ((pct2 - pct1) / (split2 - split1)) * (x - split1), pct2 + ((1.0 - pct2) / (max_val - split2)) * (x - split2)]
+            return np.select(conds, funcs, default=x)
+        def inverse_scale(y):
+            y = np.asarray(y, dtype=float)
+            conds = [y <= pct1, (y > pct1) & (y <= pct2), y > pct2]
+            funcs = [(split1 / pct1) * y, split1 + ((split2 - split1) / (pct2 - pct1)) * (y - pct1), split2 + ((max_val - split2) / (1.0 - pct2)) * (y - pct2)]
+            return np.select(conds, funcs, default=y)
+        return (forward_scale, inverse_scale)
+
+    def calc_expected_grouped(self, rps_list, level=0, by_bid=False, min_rp_aep_0=None):
+        """Aggregates absolute SHAP matrix weights over the AEP curve to extract expected values."""
+        bid_name = 'bid' if by_bid else 'all'
+        output_gsa_dir = self.paths["xgb"]
+        output_path = os.path.join(output_gsa_dir, f"df_expected_l{level}_{bid_name}.feather")
+        groupby_cols = ['Feature_Group', 'BID'] if by_bid else ['Feature_Group']
+        
+        if os.path.exists(output_path):
+            return pd.read_feather(output_path).set_index(groupby_cols)
+            
+        all_rp_quantiles = []
+        for rp in rps_list:
+            shap_path = os.path.join(output_gsa_dir, f"shap_results_rp_{rp}.feather")
+            if not os.path.exists(shap_path): continue
+            
+            df_shap = pd.read_feather(shap_path)
+            meta_cols = [c for c in df_shap.columns if 'BID' in c or 'base_value' in c]
+            feature_cols = [c for c in df_shap.columns if c not in meta_cols]
+            col_mapping = [str(c).split('|')[int(level)] for c in feature_cols]
+            
+            grouped_features = df_shap[feature_cols].T.groupby(by=col_mapping).sum().T
+            if by_bid:
+                bid_col = next(c for c in meta_cols if 'BID' in c)
+                grouped_features['BID'] = df_shap[bid_col]
+                quantiles = grouped_features.set_index('BID').abs().groupby('BID').quantile([0.05, 0.50, 0.95])
+                quantiles.index.names = ['BID', 'Quantile']
+                quantiles = quantiles.T.stack(level='BID', future_stack=True)
+                quantiles.columns = ['Q05', 'Q50', 'Q95']
+                quantiles.index.names = ['Feature_Group', 'BID']
+            else:
+                quantiles = grouped_features.abs().quantile([0.05, 0.50, 0.95]).T
+                quantiles.columns = ['Q05', 'Q50', 'Q95']
+                quantiles.index.name = 'Feature_Group'
+                
+            quantiles['RP'] = rp
+            all_rp_quantiles.append(quantiles)
+            
+        if not all_rp_quantiles: return pd.DataFrame()
+        df_all = pd.concat(all_rp_quantiles).reset_index()
+        
+        if min_rp_aep_0 is not None:
+            unique_groups = df_all[groupby_cols].drop_duplicates()
+            unique_groups['Q05'] = unique_groups['Q50'] = unique_groups['Q95'] = 0.0
+            unique_groups['RP'] = float(min_rp_aep_0)
+            df_all = pd.concat([df_all, unique_groups], ignore_index=True)
+            
+        df_all['AEP'] = 1.0 / df_all['RP']
+        df_pivot = df_all.pivot(index=groupby_cols, columns='AEP', values=['Q05', 'Q50', 'Q95']).fillna(0.0).sort_index(axis=1, level='AEP')
+        aep_axes = df_pivot.columns.get_level_values('AEP').unique().values
+        
+        df_expected = pd.DataFrame({
+            'Q05': np.trapezoid(df_pivot['Q05'].values, x=aep_axes, axis=1),
+            'Q50': np.trapezoid(df_pivot['Q50'].values, x=aep_axes, axis=1),
+            'Q95': np.trapezoid(df_pivot['Q95'].values, x=aep_axes, axis=1)
+        }, index=df_pivot.index).reset_index()
+        
+        for col in ['Q05', 'Q50', 'Q95']:
+            total_sum = df_expected.groupby('BID')[col].transform('sum') if by_bid else df_expected[col].sum()
+            df_expected[f'{col}_share_%'] = np.where(total_sum != 0, (df_expected[col] / total_sum) * 100, 0.0) if by_bid else (df_expected[col] / total_sum) * 100 if total_sum != 0 else 0.0
+
+        df_expected = df_expected.sort_values(by='Q50', ascending=False).set_index(groupby_cols)
+        df_expected.reset_index().to_feather(output_path)
+        return df_expected
+
+    def calc_rp_evolution_grouped(self, rps_list, level=0, by_bid=False):
+        """Extracts and formats intermediate variance trends across distinct return period horizons."""
+        bid_name = 'bid' if by_bid else 'all'
+        output_gsa_dir = self.paths["xgb"]
+        output_path = os.path.join(output_gsa_dir, f"df_evolution_l{level}_{bid_name}.feather")
+        groupby_cols = ['Feature_Group', 'BID'] if by_bid else ['Feature_Group']
+        
+        if os.path.exists(output_path):
+            return pd.read_feather(output_path).set_index(groupby_cols)
+            
+        all_rp_data = []
+        for rp in rps_list:
+            shap_path = os.path.join(output_gsa_dir, f"shap_results_rp_{rp}.feather")
+            if not os.path.exists(shap_path): continue
+            
+            df_shap = pd.read_feather(shap_path)
+            meta_cols = [c for c in df_shap.columns if 'BID' in c or 'base_value' in c]
+            feature_cols = [c for c in df_shap.columns if c not in meta_cols]
+            col_mapping = [str(c).split('|')[int(level)] for c in feature_cols]
+            
+            grouped_features = df_shap[feature_cols].T.groupby(by=col_mapping).sum().T
+            if by_bid:
+                bid_col = next(c for c in meta_cols if 'BID' in c)
+                grouped_features['BID'] = df_shap[bid_col]
+                q50 = grouped_features.set_index('BID').abs().groupby('BID').quantile(0.50).stack(future_stack=True).reset_index()
+                q50.columns = ['BID', 'Feature_Group', 'Q50']
+                total = q50.groupby('BID')['Q50'].transform('sum')
+                q50['Share_%'] = np.where(total != 0, (q50['Q50'] / total) * 100, 0.0)
+            else:
+                q50 = grouped_features.abs().quantile(0.50).reset_index()
+                q50.columns = ['Feature_Group', 'Q50']
+                total = q50['Q50'].sum()
+                q50['Share_%'] = (q50['Q50'] / total) * 100 if total != 0 else 0.0
+                
+            q50['RP'] = rp
+            all_rp_data.append(q50)
+            
+        if not all_rp_data: return pd.DataFrame()
+        df_pivot = pd.concat(all_rp_data, ignore_index=True).pivot(index=groupby_cols, columns='RP', values=['Q50', 'Share_%']).fillna(0.0)
+        df_pivot.columns = [f"{m}_RP{rp}" for m, rp in df_pivot.columns]
+        df_evolution = df_pivot.sort_index()
+        df_evolution.reset_index().to_feather(output_path)
+        return df_evolution
+
+    def generate_scaled_multilayer_sankey(self, df_list, relations_list, scale_params=None):
+        """Constructs unified structural flow charts linking structural subsets together securely."""
+        if len(df_list) - 1 != len(relations_list):
+            raise ValueError("relations_list length must equal len(df_list) - 1.")
+            
+        nodes = []
+        links = []
+        node_counter = 0
+        num_layers = len(df_list)
+        x_coords = np.linspace(0.1, 0.9, num_layers)
+        
+        global_max_vol = max(df['Q50_share_%'].sum() for df in df_list)
+        
+        if scale_params:
+            raw_split = global_max_vol * scale_params['data_pct']
+            v_pct = scale_params['canvas_pct']
+            fwd = lambda x: np.where(
+                x <= raw_split, 
+                (v_pct / raw_split) * x, 
+                v_pct + ((1.0 - v_pct) / (global_max_vol - raw_split)) * (x - raw_split)
+            )
+        else:
+            fwd = lambda x: x / global_max_vol
+
+        layer_node_tracking = []
+        
+        # --- PHASE 1: GENERATE NODES ---
+        for i in range(num_layers):
+            df_clean = df_list[i].dropna(subset=['Q50_share_%']).copy()
+            sorted_features = df_clean.sort_values(by='Q50_share_%', ascending=False).index.tolist()
+            layer_map = {}
+            cum_vol = 0.0
+            
+            for feat in sorted_features:
+                val = df_clean.loc[feat, 'Q50_share_%']
+                v0 = float(fwd(cum_vol))
+                v1 = float(fwd(cum_vol + val))
+                clean_name = str(feat).split(' (')[0].split('_')[0]
+                
+                nodes.append({
+                    "name": f"{feat} (L{i+1})", 
+                    "x": x_coords[i], 
+                    "y": v0, 
+                    "h": v1 - v0, 
+                    "color": self.gsa_group_colors.get(clean_name, '#cccccc')
+                })
+                
+                layer_map[feat] = {
+                    'id': node_counter, 
+                    'val': val, 
+                    'out_curr_raw': cum_vol, 
+                    'in_curr_raw': cum_vol
+                }
+                node_counter += 1
+                cum_vol += val
+                
+            layer_node_tracking.append(layer_map)
+
+        # --- PHASE 2: ROUTE LINKS ---
+        for i in range(num_layers - 1):
+            left_map = layer_node_tracking[i]
+            right_map = layer_node_tracking[i+1]
+            relations = relations_list[i]
+            
+            split_srcs = set(relations.keys())
+            split_tgts = set([t for ts in relations.values() for t in ts])
+            
+            rev_rels = {}
+            for s, ts in relations.items():
+                for t in ts: 
+                    rev_rels.setdefault(t, []).append(s)
+
+            # 1. Explicit Relations (Splits 1-to-N and Merges N-to-1)
+            for src_feat, target_list in relations.items():
+                if src_feat not in left_map: continue
+                s_info = left_map[src_feat]
+                t_total = sum([right_map[t]['val'] for t in target_list if t in right_map])
+                
+                for tgt_feat in target_list:
+                    if tgt_feat not in right_map: continue
+                    t_info = right_map[tgt_feat]
+                    src_total = sum([left_map[s]['val'] for s in rev_rels[tgt_feat] if s in left_map])
+                    
+                    s_link = s_info['val'] * (t_info['val'] / t_total if t_total > 0 else 0)
+                    t_link = t_info['val'] * (s_info['val'] / src_total if src_total > 0 else 0)
+                    
+                    s0 = float(fwd(s_info['out_curr_raw']))
+                    s1 = float(fwd(s_info['out_curr_raw'] + s_link))
+                    t0 = float(fwd(t_info['in_curr_raw']))
+                    t1 = float(fwd(t_info['in_curr_raw'] + t_link))
+                    
+                    links.append({
+                        "source": s_info['id'], 
+                        "target": t_info['id'], 
+                        "value_src": s1 - s0, 
+                        "value_tgt": t1 - t0, 
+                        "src_y": s0, 
+                        "tgt_y": t0, 
+                        "color": nodes[s_info['id']]['color']
+                    })
+                    s_info['out_curr_raw'] += s_link
+                    t_info['in_curr_raw'] += t_link
+
+            # 2. Standard 1-to-1 Connections
+            for feat in left_map.keys():
+                if feat in split_srcs or feat not in right_map or feat in split_tgts: continue
+                
+                s_info = left_map[feat]
+                t_info = right_map[feat]
+                
+                s0 = float(fwd(s_info['out_curr_raw']))
+                s1 = float(fwd(s_info['out_curr_raw'] + s_info['val']))
+                t0 = float(fwd(t_info['in_curr_raw']))
+                t1 = float(fwd(t_info['in_curr_raw'] + t_info['val']))
+                
+                links.append({
+                    "source": s_info['id'], 
+                    "target": t_info['id'], 
+                    "value_src": s1 - s0, 
+                    "value_tgt": t1 - t0, 
+                    "src_y": s0, 
+                    "tgt_y": t0, 
+                    "color": nodes[s_info['id']]['color']
+                })
+                s_info['out_curr_raw'] += s_info['val']
+                t_info['in_curr_raw'] += t_info['val']
+                
+        return nodes, links
+    
+    def plot_gsa_sensitivity_analysis(self, gdf_buildings, re_run_grouping=False):
+        """
+        Executes the Global Sensitivity Analysis (GSA) parsing pipeline, handles multi-tiered 
+        SHAP multi-index string grouping, builds a physical spatial rank-combination map, 
+        and renders the final 4-panel multi-resolution mosaic figure using vectorized configurations.
+        """
+        # Define hierarchical regex extraction matching rules local to the pipeline execution
+        def rule_l1(c):
+            if c in ['IH', 'BH', 'GL', 'Cga']: return "Structure"
+            if c in ['ed', 'he', 'base_value', 'BID']: return c
+            if c.startswith('p_'): return "Prices (p_)"
+            if c.startswith('n_'): return "Objects (n_)"
+            if c.startswith('hc_'): return "C.High (hc_)"
+            if c.startswith('m_'): return "Materials (m_)"
+            return "Unclassified"
+        
+        def rule_l2(c):
+            if c in ['ed', 'he', 'IH', 'BH', 'GL', 'Cga', 'base_value', 'BID']: return c
+            if c.startswith('p_'): return "Prices (p_)"
+            if c.startswith('n_'): return "Objects (n_)"
+            if c.startswith('hc_'): return "C.High (hc_)"
+            if c.startswith('m_'): return "Materials (m_)"
+            return "Unclassified"
+        
+        def rule_l3(c):
+            if c in ['ed', 'he', 'IH', 'BH', 'GL', 'Cga', 'base_value', 'BID']: return c
+            content_pattern = r'_(APP|CLO|COM|DEC|ELE|ENG|FAD|FUR|HHG|HHB|INS|LEI|OTH|SPE|TOO|VEH)(_|$)'
+            continent_pattern = r'_(ETP|EXF|WND|PUM|PRW|ITP|SOI|CLE|SKT|RDR|PLG|FRI)(_|$)'
+            prefix_map = {'p_': 'Prices', 'n_': 'Objects', 'hc_': 'C.High', 'm_': 'Materials'}
+            for prefix, base_name in prefix_map.items():
+                if c.startswith(prefix):
+                    if re.search(content_pattern, c): return f"{base_name}_CTE"
+                    elif re.search(continent_pattern, c): return f"{base_name}_CTI"
+                    else: return f"{base_name}_Unclassified"
+            return "Unclassified"
+        
+        def rule_l4(c):
+            if c in ['ed', 'he', 'IH', 'BH', 'GL', 'Cga', 'base_value', 'BID']: return c
+            for prefix, name in [('p_', 'Prices'), ('n_', 'Objects'), ('hc_', 'C.High'), ('m_', 'Materials')]:
+                if c.startswith(prefix):
+                    if prefix == 'm_': return f"{name} ({prefix})"
+                    match = re.search(r'_(-?\d+)$', c)
+                    floor = f"{match.group(1)}floor" if match else "global"
+                    return f"{name} {floor} ({prefix})"
+            return "Unclassified"
+
+        def rule_l5(c):
+            if c in ['ed', 'he', 'IH', 'BH', 'GL', 'Cga', 'base_value', 'BID']: return c
+            if re.search(r'_(APP|CLO|COM|DEC|ELE|ENG|FAD|FUR|HHG|HHB|INS|LEI|OTH|SPE|TOO|VEH)(_|$)', c): return "Content"
+            if re.search(r'_(ETP|EXF|WND|PUM|PRW|ITP|SOI|CLE|SKT|RDR|PLG|FRI)(_|$)', c) or c.startswith(('p_ETP', 'p_EXF', 'p_WND', 'p_PUM', 'p_PRW', 'p_ITP', 'p_SOI', 'p_CLE', 'p_SKT', 'p_RDR', 'p_PLG', 'm_ETP', 'm_EXF', 'm_WND', 'm_PUM', 'm_PRW', 'm_ITP', 'm_SOI', 'm_CLE', 'm_SKT', 'm_RDR', 'm_PLG')): return "Continent"
+            return "Unclassified"
+        
+        def rule_l6(c):
+            if c in ['ed', 'he', 'IH', 'BH', 'GL', 'Cga', 'base_value', 'BID']: return c
+            pattern = r'_(APP|CLO|COM|DEC|ELE|ENG|FAD|FUR|HHG|HHB|INS|LEI|OTH|SPE|TOO|VEH|ETP|EXF|WND|PUM|PRW|ITP|SOI|CLE|SKT|RDR|PLG|FRI)(_|$)'
+            match = re.search(pattern, c)
+            return match.group(1) if match else "Unclassified"
+
+        rps = list(self.return_periods.keys())
+        
+        output_gsa_dir = self.paths["xgb"]
+        os.makedirs(output_gsa_dir, exist_ok=True)
+
+        # PHASE 1: RE-RUN MATRIX COLUMN STRATIFICATION IF REQUESTED
+        if re_run_grouping:
+            for rp in rps:
+                shap_path = os.path.join(output_gsa_dir, f"shap_results_rp_{rp}.feather")
+                if not os.path.exists(shap_path):
+                    continue
+                df_shap_rp = pd.read_feather(shap_path)
+                grouper = shap_results_grouper(df_shap_rp.columns.tolist(), separator="|")
+                grouper.remove_all_levels()
+                grouper.add_level(rules=rule_l1)
+                grouper.add_level(rules=rule_l2)
+                grouper.add_level(rules=rule_l3)
+                grouper.add_level(rules=rule_l4)
+                grouper.add_level(rules=rule_l5)
+                grouper.add_level(rules=rule_l6)
+                df_shap_rp = grouper.update_dataframe(df_shap_rp)
+                df_shap_rp.to_parquet(shap_path)  # Standardized framework formats
+
+        # PHASE 2: LAUNCH TRApeZOIDAL MATRICES COMPUTATIONS FOR ALL CORES
+        df_expected_l1_all = self.calc_expected_grouped(rps, level=1, by_bid=False, min_rp_aep_0=2)
+        df_expected_l1_bid = self.calc_expected_grouped(rps, level=1, by_bid=True, min_rp_aep_0=2)
+        df_evolution_l1_all = self.calc_rp_evolution_grouped(rps, level=1, by_bid=False)
+        df_expected_l2_all = self.calc_expected_grouped(rps, level=2, by_bid=False, min_rp_aep_0=2)
+        df_expected_l3_all = self.calc_expected_grouped(rps, level=3, by_bid=False, min_rp_aep_0=2)
+        df_expected_l5_all = self.calc_expected_grouped(rps, level=5, by_bid=False, min_rp_aep_0=2)
+        df_expected_l6_all = self.calc_expected_grouped(rps, level=6, by_bid=False, min_rp_aep_0=2)
+
+        # PHASE 3: SANKEY CONNECTIVITY MAP TRACKING
+        relations_l1_to_l2 = {'Structure': ['GL', 'BH', 'Cga', 'IH']}
+        relations_l2_to_l3 = {
+            'Prices (p_)': ['Prices_CTE', 'Prices_CTI'],
+            'Objects (n_)': ['Objects_CTE', 'Objects_CTI'],
+            'C.High (hc_)': ['C.High_CTE', 'C.High_CTI'],
+            'Materials (m_)': ['Materials_CTE', 'Materials_CTI']
+        }
+        relations_l3_to_l5 = {
+            'C.High_CTI': ['Continent'], 'Prices_CTI': ['Continent'], 'Objects_CTI': ['Continent'], 'Materials_CTI': ['Continent'],
+            'C.High_CTE': ['Content'], 'Prices_CTE': ['Content'], 'Objects_CTE': ['Content']
+        }
+        relations_l5_to_l6 = {
+            'Content': ['APP', 'CLO', 'COM', 'DEC', 'ELE', 'ENG', 'FAD', 'FUR', 'HHG', 'HHB', 'INS', 'LEI', 'OTH', 'SPE', 'TOO', 'VEH'],
+            'Continent': ['PUM', 'CLE', 'DHU', 'SOI', 'FRI', 'SKT', 'RDR', 'WND', 'PLG', 'PRW', 'EXF', 'ETP', 'ITP', 'ELS']
+        }
+        custom_scale_parameters = {'data_pct': 0.5, 'canvas_pct': 0.1}
+
+        nodes, links = self.generate_scaled_multilayer_sankey(
+            df_list=[df_expected_l1_all, df_expected_l2_all, df_expected_l3_all, df_expected_l5_all, df_expected_l6_all],
+            relations_list=[relations_l1_to_l2, relations_l2_to_l3, relations_l3_to_l5, relations_l5_to_l6],
+            scale_params=custom_scale_parameters
+        )
+        for node in nodes:
+            node['name'] = re.sub(r'\s*\(L\d+\)', '', node['name']).strip()
+
+        # PHASE 4: SPATIAL COMBINATION AND RANK COMPUTATION OVER CENTROIDS
+        k_vars = 4
+        acronym_map = {'he': 'he', 'C.High (hc_)': 'hc', 'Objects (n_)': 'n', 'Structure': 'S', 'Prices (p_)': 'p', 'ed': 'ed', 'Materials (m_)': 'm'}
+        
+        df_reset = df_expected_l1_bid.reset_index()
+        df_sorted = df_reset.sort_values(by=['BID', 'Q50'], ascending=[True, False])
+        top_k = df_sorted.groupby('BID').head(k_vars).copy()
+        top_k['Short_Feature'] = top_k['Feature_Group'].map(lambda x: acronym_map.get(str(x).strip(), str(x).strip()))
+        
+        combinations = top_k.groupby('BID')['Short_Feature'].apply(lambda x: ' | '.join(x)).reset_index()
+        combinations.rename(columns={'Short_Feature': 'Top_7_Combo'}, inplace=True)
+        unique_combos = combinations['Top_7_Combo'].unique()
+        
+        cmap = plt.get_cmap('tab20')
+        color_map = {combo: mcolors.to_hex(cmap(i % 20)) for i, combo in enumerate(unique_combos)}
+        combinations['combo_color'] = combinations['Top_7_Combo'].map(color_map)
+
+        gdf_shap = gdf_buildings.merge(combinations, on='BID', how='left')
+        gdf_shap['combo_color'] = gdf_shap['combo_color'].fillna('#cccccc')
+        gdf_shap_centroids = gdf_shap.copy()
+        gdf_shap_centroids['geometry'] = gdf_shap.centroid
+        gdf_shap_centroids_4326 = gdf_shap_centroids.to_crs(epsg=4326)
+        minx, miny, maxx, maxy = gdf_shap_centroids_4326.total_bounds
+        buffer = 0.01
+        plot_extent = [minx - buffer, maxx + buffer, miny - buffer, maxy + buffer]
+
+        # PHASE 5: DICTIONARY RND LAYOUT CONFIGURATION GENERATION
+        layout_params = {
+            'layout': 'mosaic',
+            'mosaic_structure': [["a", "a"], ["b", "d"], ["c", "d"], ["leg", "leg"]],
+            'figsize': (6, 8),
+            'kwargs': {'gridspec_kw': {'wspace': 0.1, 'hspace': 0.4, 'width_ratios': [1, 1.5], 'height_ratios': [2, 1, 1, 0.4]}},
+            'adjust': {'bottom': 0.1, 'top': 0.9, 'left': 0.13, 'right': 0.9}
+        }
+        
+        dict_to_plot = {}
+        real_ratio = self.get_ax_ratio(layout_params, 'a')
+        xmin, xmax, ymin, ymax = self.calc_map_extent((4, 43, 00), (40, 24, 52), 115, real_ratio)
+
+        # Panel A: Map Configuration
+        self.init_dic(dict_to_plot, 'a', 'plots')
+        dict_to_plot['a']['plots'].extend([
+            {
+                'plot_type': 'wms',
+                'url': 'https://www.ign.es/wms-inspire/pnoa-ma?request=GetCapabilities&service=WMS',
+                'layers': ['OI.OrthoimageCoverage'], 'extent': plot_extent, 'crs': 'EPSG:4326', 'size': (1000, 1000), 'alpha': 1, 'zorder': 1
+            },
+            {
+                'plot_type': 'scatter', 'x': gdf_shap_centroids_4326.geometry.x, 'y': gdf_shap_centroids_4326.geometry.y,
+                'color': gdf_shap_centroids_4326['combo_color'].tolist(), 's': 6, 'zorder': 3
+            }
+        ])
+
+        # Overlay manual custom bounding annotations for map labels
+        legend_x, legend_y, y_step = xmin + (xmax - xmin) * 0.02, ymax - (ymax - ymin) * 0.02, (ymax - ymin) * 0.04
+        dict_to_plot['a']['plots'].append({
+            'plot_type': 'text', 'x': legend_x, 'y': legend_y, 'text': "Top 4 Variables Rank:", 'fontsize': 8, 'color': 'white',
+            'ha': 'left', 'va': 'top', 'transform': 'data', 'fontweight': 'bold', 'path_effects': [pe.withStroke(linewidth=2, foreground="black")], 'zorder': 5
+        })
+        for i, combo in enumerate(unique_combos):
+            dict_to_plot['a']['plots'].append({
+                'plot_type': 'text', 'x': legend_x, 'y': legend_y - ((i + 1) * y_step), 'text': f"■ {combo}", 'color': color_map[combo],
+                'fontsize': 6, 'ha': 'left', 'va': 'top', 'transform': 'data', 'path_effects': [pe.withStroke(linewidth=1, foreground="black")], 'zorder': 5
+            })
+
+        # Panel B: Absolute Quantile SHAP Weights
+        self.init_dic(dict_to_plot, 'b', 'plots')
+        bar_colors_b = [self.gsa_group_colors.get(re.sub(r'\s*\([^)]*\)', '', str(grp)).strip(), '#cccccc') for grp in df_expected_l1_all.index]
+        dict_to_plot['b']['plots'].append({
+            'plot_type': 'barh', 'y': df_expected_l1_all.index.tolist(), 'width': df_expected_l1_all['Q50'].values, 'color': bar_colors_b, 'linewidth': 0, 'alpha': 1
+        })
+        for idx, row in df_expected_l1_all.iterrows():
+            dict_to_plot['b']['plots'].append({
+                'plot_type': 'text', 'x': row['Q50'], 'y': idx, 'text': f" {row['Q50_share_%']:.2f}%", 'transform': 'data', 'va': 'center', 'ha': 'left', 'fontsize': 8, 'color': 'black'
+            })
+
+        # Panel C: Evolution over Return Periods (RP)
+        self.init_dic(dict_to_plot, 'c', 'plots')
+        share_cols = [col for col in df_evolution_l1_all.columns if col.startswith('Share_%_RP')]
+        rps_numeric = [int(col.replace('Share_%_RP', '')) for col in share_cols]
+        sorted_idx = np.argsort(rps_numeric)
+        share_cols_sorted = [share_cols[i] for i in sorted_idx]
+        rps_categorical = [str(rps_numeric[i]) for i in sorted_idx]
+        for feature_name, row in df_evolution_l1_all.iterrows():
+            feat_color = self.gsa_group_colors.get(re.sub(r'\s*\([^)]*\)', '', str(feature_name)).strip(), '#cccccc')
+            dict_to_plot['c']['plots'].append({
+                'plot_type': 'line', 'x': rps_categorical, 'y': row[share_cols_sorted].values, 'color': feat_color, 'marker': 'o', 'markersize': 3, 'linewidth': 1.5, 'label': feature_name
+            })
+
+        # Panel D: Multi-Layer Funneling Sankey
+        self.init_dic(dict_to_plot, 'd', 'plots')
+        dict_to_plot['d']['plots'].append({'plot_type': 'sankey', 'node_width': 0.02, 'fontsize': 8, 'nodes': nodes, 'links': links})
+        x_positions = np.linspace(0.1, 0.9, 5)
+        for layer_idx, lbl in enumerate(['L1', 'L2', 'L3', 'L5', 'L6']):
+            dict_to_plot['d']['plots'].append({'plot_type': 'text', 'x': x_positions[layer_idx], 'y': -0.05, 'text': lbl, 'transform': 'data', 'va': 'center', 'ha': 'center'})
+
+        # STYLE SPECIFICATIONS ROUTING
+        self.init_dic(dict_to_plot, 'a', 'style')
+        dict_to_plot['a']['style'].extend([
+            {'style_type': 'grid', 'visible': True, 'linestyle': '--', 'alpha': 0.3, 'zorder': 1},
+            {'style_type': 'xlim', 'left': xmin, 'right': xmax}, {'style_type': 'ylim', 'bottom': ymin, 'top': ymax},
+            {'style_type': 'aspect', 'aspect': 'equal'}, {'style_type': 'spines', 'top': True, 'right': True, 'left': True, 'bottom': True},
+            {'style_type': 'ticks_params', 'which': 'both', 'labelsize': 8, 'top': True, 'bottom': False, 'left': True, 'right': False, 'labeltop': True, 'labelbottom': False, 'labelleft': True, 'labelright': False},
+            {'style_type': 'ticks_params', 'axis': 'y', 'labelrotation': 90}, {'style_type': 'yticklabels', 'labels': []},
+            {'style_type': 'major_formatter', 'axis': 'y', 'formatter_type': 'dms_suffix', 'suffix': ' N'},
+            {'style_type': 'major_formatter', 'axis': 'x', 'formatter_type': 'dms_suffix', 'suffix': ' W'}
+        ])
+
+        self.init_dic(dict_to_plot, 'b', 'style')
+        self.init_dic(dict_to_plot, 'c', 'style')
+        self.init_dic(dict_to_plot, 'd', 'style')
+        self.init_dic(dict_to_plot, 'leg', 'style')
+
+        dict_to_plot['b']['style'].extend([
+            {'style_type': 'xlabel', 'label': 'Expected Annual Average |SHAP|'},
+            {'style_type': 'xscale', 'value': 'function', 'functions': self.create_3_linear_ax_scale(df_expected_l2_all['Q50'].max(), 1, 10, 0.05, 0.10)},
+            {'style_type': 'xticks', 'ticks': [0, 1, 10, 50, 100, 150, 200, 250, 300]},
+            {'style_type': 'xticklabels', 'labels': ['0', '1', '10', '50', '100', '150', '200', '250', '300']}
+        ])
+
+        dict_to_plot['c']['style'].extend([
+            {'style_type': 'xlabel', 'label': 'Return Period (RP)'}, {'style_type': 'ylabel', 'label': 'Share % of total |SHAP|'},
+            {'style_type': 'yscale', 'value': 'function', 'functions': self.create_3_linear_ax_scale(75, 10, 50, 0.50, 0.80)},
+            {'style_type': 'yticks', 'ticks': [0, 10, 20, 30, 40, 50, 60, 70]}, {'style_type': 'yticklabels', 'labels': ['0', '10', '', '30', '', '50', '', '70']},
+            {'style_type': 'ylim', 'ymin': 0, 'ymax': 75}
+        ])
+
+        dict_to_plot['d']['style'].extend([{'style_type': 'off'}, {'style_type': 'xlim', 'xmin': -0.1, 'xmax': 1.1}, {'style_type': 'ylim', 'ymin': 0.0, 'ymax': 1.0}])
+        dict_to_plot['leg']['style'].append({'style_type': 'off'})
+
+        # Append structured sub-panel letter tokens programmatically
+        for key in dict_to_plot.keys():
+            if key != 'leg':
+                dict_to_plot[key]['style'].append({
+                    'style_type': 'letter', 'label': f'({key})', 'x': -0.05 if key in ['b', 'c', 'd'] else -0.01, 'y': 1.05 if key in ['a', 'd'] else 1.1
+                })
+
+        self.init_dic(dict_to_plot, 'leg', 'legend')
+        
+        # Save output targeting properties extracted directly from single-source configurations
+        gsa_target_path = Path(self.paths['gsa'])
+        save_params = {
+            'output_dir': str(gsa_target_path.parent),
+            'subfolder': '',
+            'fname': gsa_target_path.name,
+            'show': True,
+            'dpi': 300
+        }
+
+        # Flush layout updates out via global drawing configurations
+        return self.plot_any(dict_to_plot, layout_params, save_params, global_pre_style=self.global_pre_style)
+    
+def _process_bid_worker(args, alphas, epsilons):
+    """Module-level un-nested standalone worker function for Vats criterion execution mapping."""
+    import numpy as np
+    from math import pi, gamma
+    from scipy.stats import f
+
+    subset, bid, n = args
+    alphas_processed = [a/100 for a in alphas]
+    epsilons_processed = [e/100 for e in epsilons]
+    
+    col_var = np.var(subset, axis=0)
+    active = col_var > 0
+    p_eff = int(active.sum())
+    
+    if p_eff < 2 or n <= p_eff:
+        return {"bid": bid, "status": "skipped", "logs": [f"Warning: n={n} <= p_eff={p_eff}"]}
+        
+    subset = subset[:, active].astype(np.float64)
+    cov = np.cov(subset, rowvar=False, ddof=1)
+    det = np.linalg.det(cov)
+    
+    if det <= 0:
+        return {"bid": bid, "status": "skipped", "logs": [f"Warning: Non-positive det={det:.2e}"]}
+        
+    unit_ball_vol = (pi ** (p_eff / 2)) / gamma(p_eff / 2 + 1)
+    metrics = {}
+    
+    for a in alphas_processed:
+        c_n = (p_eff * (n - 1) / (n - p_eff)) * f.ppf(1 - a, p_eff, n - p_eff)
+        metrics[f"lhs_{int(a*100):02d}"] = (unit_ball_vol * (c_n / n) ** (p_eff / 2) * (det ** 0.5)) ** (1 / p_eff) + 1 / n
+    for e in epsilons_processed:
+        metrics[f"rhs_{int(e*100):02d}"] = e * det ** (1 / (2 * p_eff))
+
+    residuals, active_statuses, overall_active = {}, {}, False
+    for a in alphas:
+        for e in epsilons:
+            suffix = f"a{a:02d}_e{e:02d}"
+            res_val = max(0.0, metrics[f"lhs_{a:02d}"] - metrics[f"rhs_{e:02d}"])
+            residuals[f"res_{suffix}"] = res_val
+            active_statuses[f"rem_{suffix}"] = 1 if res_val > 0 else 0
+            if res_val > 0: overall_active = True
+
+    return {
+        "status": "active" if overall_active else "converged", 
+        "bid": bid, "residuals": residuals, "active_counts": active_statuses, "logs": []
+    }
+
+if __name__ == "__main__":
+    import time
+    import geopandas as gpd
+    from pathlib import Path
+    
+    # FIX 1: Force a completely headless background rendering backend
+    import matplotlib
+    matplotlib.use('Agg') 
+    import matplotlib.pyplot as plt
+
+    # 1. Import single-source structural paths and configuration assets
+    from src.config import PATHS, CODES, RETURN_PERIODS
+    
+    print("[INFO] Initializing In-Depth-PROFILE Headless Results Visualizer...")
+    start_time = time.time()
+    
+    # 2. Instantiate the Object-Oriented Visualizer Engine
+    visualizer = ResultsVisualizer(
+        config_paths=PATHS,
+        config_codes=CODES,
+        config_return_periods=RETURN_PERIODS
+    )
+    
+    # 3. Dynamically resolve your machine learning surrogate matrix location
+    target_gsa_dir = PATHS["xgb"]
+    
+    print(f"[PATH] Dynamic GSA directory resolved to: {target_gsa_dir}")
+    print("[INFO] Loading Cadastral building vector layer geometries...")
+    
+    try:
+        # Load official cadaster layer managed by PATHS single source of truth [cite: 2239]
+        gdf_buildings = gpd.read_file(PATHS['buildings_shp'])
+        
+        # Verify and clean crucial linkage attributes to prevent merge drops [cite: 2332]
+        gdf_buildings = gdf_buildings.dropna(subset=['BID'])
+        gdf_buildings['BID'] = gdf_buildings['BID'].astype(int)
+        
+        print(f"[SUCCESS] Loaded {len(gdf_buildings)} structural footprints.")
+        
+        # 4. Trigger the full multi-tier GSA plotting pipeline using config path
+        print("[PIPELINE] Invoking Global Sensitivity Analysis visualization loop...")
+        
+        # We wrap this in a temporary patch to fix the NaN color crash on the scatter layer
+        # until you commit Option 1 permanently inside your method body.
+        old_gsa = visualizer.plot_gsa_sensitivity_analysis
+        
+        def safe_gsa_wrapper(*args, **kwargs):
+            # Intercept and clean your building inputs prior to plot execution
+            gdf_b = kwargs.get('gdf_buildings', args[1] if len(args) > 1 else None)
+            if gdf_b is not None:
+                # Fill any missing categorical colors with a default fallback gray
+                if 'combo_color' in gdf_b.columns:
+                    gdf_b['combo_color'] = gdf_b['combo_color'].fillna('#cccccc')
+            return old_gsa(*args, **kwargs)
+            
+        visualizer.plot_gsa_sensitivity_analysis = safe_gsa_wrapper
+
+        # Execute drawing pipeline with show=False to force raw disk compilation
+        # Note: Modify your plot_gsa_sensitivity_analysis internally to set 'show': False in save_params
+        fig, ax_dict = visualizer.plot_gsa_sensitivity_analysis(
+            gdf_buildings=gdf_buildings,
+            re_run_grouping=False  
+        )
+        
+        elapsed_time = time.time() - start_time
+        print(f"[SUCCESS] Sensitivity Analysis Figure generated cleanly in {elapsed_time:.2f}s.")
+        print(f"[OUTPUT] Master image written to path destination target: {PATHS['gsa']}")
+        
+    except FileNotFoundError as e:
+        print(f"[ERROR] Execution failed due to missing dependency file path element: {e}")
+    except Exception as e:
+        print(f"[CRITICAL] Operational workflow halted during execution: {e}")
+        import traceback
+        traceback.print_exc()
