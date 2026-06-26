@@ -12,6 +12,9 @@ __pycache__/
 ~$*.xls
 
 # Ignore all production datasets completely (to heavy, uploaded in other platform)
-data/**
-models/**
-outputs/**
+data/**/*
+!data/**/.gitkeep
+models/**/*
+!models/**/.gitkeep
+outputs/**/*
+!outputs/**/.gitkeep
