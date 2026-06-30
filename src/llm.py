@@ -38,3 +38,5 @@ def export_pipeline_to_txt():
 
 if __name__ == '__main__':
     export_pipeline_to_txt()
+
+# Run in terminal: python -m src.llm

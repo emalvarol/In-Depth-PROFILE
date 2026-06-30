@@ -839,6 +839,7 @@ class Plotter:
                         transparent=p.get('transparent', True)
                     )
                     img_data = mpimg.imread(BytesIO(img_request.read()))
+                    ax.set_facecolor('black')
                     ax.imshow(img_data, extent=extent, origin='upper',
                               **get_kwargs(p, ['url', 'layers', 'extent'] + ['version', 'crs', 'size', 'format', 'transparent']))
                 
@@ -948,6 +949,22 @@ class Plotter:
                 
                 elif stype == 'ticklabel_format':
                     ax.ticklabel_format(**get_kwargs(s, []))
+                
+                elif stype == 'minor_locator':
+                    import matplotlib.ticker as ticker
+                    axis_name = s.get('axis', 'both')
+                    loc_type = s.get('locator_type', 'log')
+                    
+                    def apply_axis_locator(target_axis_obj):
+                        if loc_type == 'log':
+                            base_val = s.get('base', 10.0)
+                            subs_val = s.get('subs', range(1, 10))
+                            target_axis_obj.set_minor_locator(ticker.LogLocator(base=base_val, subs=subs_val))
+                        elif loc_type == 'null':
+                            target_axis_obj.set_minor_locator(ticker.NullLocator())
+
+                    if axis_name in ['x', 'both']: apply_axis_locator(ax.xaxis)
+                    if axis_name in ['y', 'both']: apply_axis_locator(ax.yaxis)
                 
                 elif stype == 'major_formatter':
                     import matplotlib.ticker as ticker

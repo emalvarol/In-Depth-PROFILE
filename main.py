@@ -9,7 +9,7 @@ from pandarallel import pandarallel
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.patheffects as pe
-
+import colorsys
 
 from src.config import PATHS, CODES, RETURN_PERIODS, DIST_CATALOG, RST
 
@@ -153,20 +153,30 @@ def run_pipeline():
             RPs_unq = list(RETURN_PERIODS.keys())
             # Colors
             gsa_group_colors = {
-                'he': "#ff0000",
-                'Structure': "#ff7300",
-                'IH': "#612c00", 'BH': "#a04800",
-                'GL': "#fd9744", 'Cga': "#ffb981",
-                'C.High': "#00b8a8",
-                'C.High_CTE': "#00b8a8", 'C.High_CTI': "#00b8a8",
-                'Prices': "#005eeb",
-                'Prices_CTE': "#005eeb", 'Prices_CTI': "#005eeb",
-                'Objects': "#2700b4",
-                'Objects_CTE': "#2700b4", 'Objects_CTI': "#2700b4",
-                'ed': "#ae00ff",
-                'Materials': "#ff0095", 'Materials_CTI': "#ff0095",
-                'Content': "#2de000",
-                'Continent': "#00751D",
+                # Hydrology / Hazard State
+                'he': "#FF0000",           # Pure Red
+                # Structural Building Components
+                'Structure': "#FF6600",    # Intense Orange
+                'IH': "#993300",           # Deep Burnt Orange
+                'BH': "#B35900",           # Medium Brown-Orange
+                'GL': "#FFCC00",           # Vivid Yellow-Gold
+                'Cga': "#FFAA00",          # Dark Amber
+                # Parameters / Constants
+                'C.High': "#00FFCC",       # Ultra Cyan/Teal
+                'C.High_CTE': "#48FFDA", 
+                'C.High_CTI': "#00A181",
+                'Prices': "#0000FF",       # Pure Blue
+                'Prices_CTE': "#4B4BFF", 
+                'Prices_CTI': "#0000A8",
+                'Objects': "#9900FF",      # Vivid Purple
+                'Objects_CTE': "#B547FF", 
+                'Objects_CTI': "#5E009C",
+                'ed': "#FF00FF",           # Neon Magenta
+                'Materials': "#FF0066",    # Hot Pink/Crimson
+                'Materials_CTI': "#FF0066",
+                # Aggregated Damage Assets
+                'Content': "#33FF00",      # Bright Lime Green
+                'Continent': "#006600",    # Deep Forest Green
             }
             # Data Grouping (Optional Re-run)
             RUN = False
@@ -373,7 +383,16 @@ def run_pipeline():
                     num_combos = len(sorted_unique_combos)
                     cmap_name = 'tab10' if num_combos <= 10 else 'tab20'
                     cmap = plt.get_cmap(cmap_name)
-                    color_map = {combo: mcolors.to_hex(cmap(i % cmap.N)) for i, combo in enumerate(sorted_unique_combos)}
+                    pastel_colors = []
+                    for i in range(num_combos):
+                        rgb_orig = cmap(i % cmap.N)[:3]
+                        h, l, s = colorsys.rgb_to_hls(*rgb_orig)
+                        l_soft = 0.82  
+                        s_soft = 0.65 
+                        rgb_soft = colorsys.hls_to_rgb(h, l_soft, s_soft)
+                        pastel_colors.append(mcolors.to_hex(rgb_soft))
+                    color_map = {combo: pastel_colors[i] for i, combo in enumerate(sorted_unique_combos)}
+                    
                     combinations[f'Top_{cumulative_threshold}%_Combo'] = pd.Categorical(
                         combinations[f'Top_{cumulative_threshold}%_Combo'], 
                         categories=sorted_unique_combos, 
@@ -386,7 +405,13 @@ def run_pipeline():
                     gdf_shap_centroids = gdf_shap.copy()
                     gdf_shap_centroids['geometry'] = gdf_shap.centroid
                     gdf_shap_centroids_4326 = gdf_shap_centroids.to_crs(epsg=4326)
-
+                    gdf_shap_centroids_4326 = gdf_shap_centroids_4326.merge(
+                        df_combo_counts[[f'Top_{cumulative_threshold}%_Combo', 'BID_count']], 
+                        on=f'Top_{cumulative_threshold}%_Combo', 
+                        how='left'
+                    )
+                    gdf_shap_centroids_4326 = gdf_shap_centroids_4326.sort_values(by='BID_count', ascending=False).reset_index(drop=True)
+                    
                     minx, miny, maxx, maxy = gdf_shap_centroids_4326.total_bounds
                     buffer = 0.01
                     plot_extent = [minx - buffer, maxx + buffer, miny - buffer, maxy + buffer]
@@ -405,14 +430,14 @@ def run_pipeline():
                     layout_params = {
                         'layout': 'mosaic',
                         'mosaic_structure': [
-                            ["a", "a"],
-                            ["b", "c"],],
+                            ["a", "b"],
+                            ["c", "c"],],
                         'figsize': (6, 8),
                         'kwargs': {'gridspec_kw': {
                             'wspace': 0.1,
                             'hspace': 0.1,
                             'width_ratios': [0.5, 0.5],
-                            'height_ratios': [0.6, 0.4]}},
+                            'height_ratios': [0.55, 0.45]}},
                         'adjust': {'bottom': 0.1, 'top': 0.9, 'left': 0.1, 'right': 0.9}
                     }
                     dict_to_plot = {}
@@ -420,13 +445,58 @@ def run_pipeline():
                     ## Plots
                     print(f"\n[STAGE 5. GSA] Preparing plots...")
                     
-                    # a
+                     # a
                     ax = 'a'
+                    plotter.init_dic(dict_to_plot, ax, 'plots')
+                    bar_colors = []
+                    for grp in df_expected_l3_all.index:
+                        grp_str = str(grp)
+                        bar_colors.append(gsa_group_colors.get(grp_str, '#cccccc'))
+                    dict_to_plot[ax]['plots'].append({
+                        'plot_type': 'barh',
+                        'y': df_expected_l3_all.index.tolist(),
+                        'width': df_expected_l3_all['Q50'].values,
+                        'color': bar_colors,
+                        'alpha': 1,
+                        'reverse': True
+                    })
+                    if not clean:
+                        for idx, row in df_expected_l3_all.iterrows():
+                            dict_to_plot[ax]['plots'].append({
+                                'plot_type': 'text', 'x': row['Q50'], 'y': idx,
+                                'text': f" {row['Q50_share_%']:.2f}%", 'transform': 'data',
+                                'va': 'center', 'ha': 'left', 'fontsize': 8, 'color': 'black'
+                            })
+
+                    # b
+                    ax = 'b'
+                    plotter.init_dic(dict_to_plot, ax, 'plots')
+                    share_cols = [col for col in df_evolution_l3_all.columns if col.startswith('Share_%_RP')]
+                    rps_numeric = [int(col.replace('Share_%_RP', '')) for col in share_cols]
+                    sorted_idx = np.argsort(rps_numeric)
+                    share_cols_sorted = [share_cols[i] for i in sorted_idx]
+                    rps_categorical = [str(rps_numeric[i]) for i in sorted_idx]
+                    for feature_name, row in df_evolution_l3_all.iterrows():
+                        feat_color = gsa_group_colors.get(feature_name, '#cccccc')
+                        y_shares = row[share_cols_sorted].values
+                        dict_to_plot[ax]['plots'].append({
+                            'plot_type': 'line', 
+                            'x': rps_categorical, 
+                            'y': y_shares, 
+                            'color': feat_color, 
+                            'marker': 'o', 
+                            'markersize': 3, 
+                            'linewidth': 2,
+                            'label': feature_name
+                        })
+                    
+                    # c
+                    ax = 'c'
                     plotter.init_dic(dict_to_plot, ax, 'plots')
                     real_ratio = plotter.get_ax_ratio(layout_params, ax)
                     top_left_x = (4, 42, 45)
-                    top_left_y = (40, 25, 00)
-                    zoom_pct = 120
+                    top_left_y = (40, 24, 53) #50
+                    zoom_pct = 90 #100
                     calc_extent_vals = plotter.calc_map_extent(top_left_x, top_left_y, zoom_pct, real_ratio)
                     xmin, xmax, ymin, ymax = calc_extent_vals
                     dict_to_plot[ax]['plots'].extend([
@@ -436,7 +506,7 @@ def run_pipeline():
                             'extent': plot_extent,
                             'crs': 'EPSG:4326',
                             'size': (1000, 1000),
-                            'alpha': 1,
+                            'alpha': 0.7, # Lower alpha to blend with the black background, creating a darker image
                             'zorder': 1
                         },
                         {'plot_type': 'gdf_shp',
@@ -479,57 +549,52 @@ def run_pipeline():
                                 'zorder': 5
                             })
 
-                    # b
-                    ax = 'b'
-                    plotter.init_dic(dict_to_plot, ax, 'plots')
-                    bar_colors_b = []
-                    for grp in df_expected_l3_all.index:
-                        grp_str = str(grp)
-                        # Base color from the prefix (e.g., Prices, Materials)
-                        base_name = grp_str.split('_CT')[0].strip()
-                        bar_colors_b.append(gsa_group_colors.get(base_name, '#cccccc'))
-                    dict_to_plot[ax]['plots'].append({
-                        'plot_type': 'barh',
-                        'y': df_expected_l3_all.index.tolist(),
-                        'width': df_expected_l3_all['Q50'].values,
-                        'color': bar_colors_b,
-                        'alpha': 1,
-                        'reverse': True
-                    })
-                    if not clean:
-                        for idx, row in df_expected_l3_all.iterrows():
-                            dict_to_plot[ax]['plots'].append({
-                                'plot_type': 'text', 'x': row['Q50'], 'y': idx,
-                                'text': f" {row['Q50_share_%']:.2f}%", 'transform': 'data',
-                                'va': 'center', 'ha': 'left', 'fontsize': 8, 'color': 'black'
-                            })
-
-                    # c
-                    ax = 'c'
-                    plotter.init_dic(dict_to_plot, ax, 'plots')
-                    share_cols = [col for col in df_evolution_l3_all.columns if col.startswith('Share_%_RP')]
-                    rps_numeric = [int(col.replace('Share_%_RP', '')) for col in share_cols]
-                    sorted_idx = np.argsort(rps_numeric)
-                    share_cols_sorted = [share_cols[i] for i in sorted_idx]
-                    rps_categorical = [str(rps_numeric[i]) for i in sorted_idx]
-                    for feature_name, row in df_evolution_l3_all.iterrows():
-                        feat_color = gsa_group_colors.get(feature_name, '#cccccc')
-                        y_shares = row[share_cols_sorted].values
-                        dict_to_plot[ax]['plots'].append({
-                            'plot_type': 'line', 
-                            'x': rps_categorical, 
-                            'y': y_shares, 
-                            'color': feat_color, 
-                            'marker': 'o', 
-                            'markersize': 3, 
-                            'linewidth': 1.5, 
-                            'label': feature_name
-                        })
-                    
                     # Style
                     print(f"\n[STAGE 5. GSA] Preparing style...")
+                    
                     # a
                     ax = 'a'
+                    plotter.init_dic(dict_to_plot, ax, 'style')
+                    dict_to_plot[ax]['style'].extend([
+    {'style_type': 'xscale', 'value': 'log'},
+])
+                    if clean:
+                        dict_to_plot[ax]['style'].extend([
+                            {'style_type': 'yticklabels', 'labels': []},
+                            {'style_type': 'xticklabels', 'labels': []}, # Clear log minor/major labels
+                            {'style_type': 'ticks_params', 'labelleft': False, 'labelbottom': False} # Force hide
+                        ])
+                    else:
+                        dict_to_plot[ax]['style'].extend([
+                            {'style_type': 'xlabel', 'label': 'Expected Annual Average |SHAP|'},
+                            {'style_type': 'xticks', 'ticks': [1e-1, 1e0, 1e1, 1e2, 1e3]},
+                        ])
+    
+                    # b
+                    ax = 'b'
+                    plotter.init_dic(dict_to_plot, ax, 'style')
+                    dict_to_plot[ax]['style'].extend([
+                        {'style_type': 'yscale', 'value': 'symlog', 'linthresh': 0.01, 'linscale': 0.12},
+                        {'style_type': 'ylim', 'ymin': 0, 'ymax': 1e2},
+                        {'style_type': 'minor_locator', 'axis': 'y', 'locator_type': 'log', 'base': 10.0, 'subs': range(1, 10)},
+                        
+                    ])
+                    if clean:
+                        dict_to_plot[ax]['style'].extend([
+                            {'style_type': 'xticklabels', 'labels': []},
+                            {'style_type': 'yticklabels', 'labels': []},
+                            {'style_type': 'ticks_params', 'labelbottom': False, 'labelleft': False},
+                        ])
+                    else:
+                        dict_to_plot[ax]['style'].extend([
+                            {'style_type': 'xlabel', 'label': 'Return Period (RP)'},
+                            {'cite_type': 'ylabel', 'label': 'Share % of total |SHAP|'},
+                            {'style_type': 'yticks', 'ticks': [0, 0.01, 0.1, 1, 10, 100]},
+                            {'style_type': 'yticklabels', 'labels': ['0','0.01', '0.1', '1', '10', '100']},
+                        ])
+                    
+                    # c
+                    ax = 'c'
                     plotter.init_dic(dict_to_plot, ax, 'style')
                     label_vis = not clean  # Determines if top/left labels are shown
                     dict_to_plot[ax]['style'].extend([
@@ -538,9 +603,10 @@ def run_pipeline():
                         {'style_type': 'ylim', 'bottom': calc_extent_vals[2], 'top': calc_extent_vals[3]},
                         {'style_type': 'aspect', 'aspect': 'equal'},
                         {'style_type': 'spines', 'top': True, 'right': True, 'left': True, 'bottom': True},
+                        # Modified tick parameters behavior:
                         {'style_type': 'ticks_params', 'which': 'both', 'labelsize': 8,
-                            'top': True, 'bottom': False, 'left': True, 'right': False,
-                            'labeltop': label_vis, 'labelbottom': False, 'labelleft': label_vis, 'labelright': False},
+                        'top': False, 'bottom': True, 'left': True, 'right': False,
+                        'labeltop': False, 'labelbottom': label_vis, 'labelleft': label_vis, 'labelright': False},
                         {'style_type': 'ticks_params', 'axis': 'y', 'labelrotation': 90},
                         {'style_type': 'yticklabels', 'va': 'center'},
                         {'style_type': 'major_formatter', 'axis': 'y', 'formatter_type': 'dms_suffix', 'suffix': ' N'},
@@ -556,56 +622,6 @@ def run_pipeline():
                             {'style_type': 'legend', 'loc': 'upper right', 'fontsize': 5, 'title': 'Top 7 Variables Rank'}
                         ])
 
-                    # b
-                    ax = 'b'
-                    plotter.init_dic(dict_to_plot, ax, 'style')
-                    x_max = df_expected_l3_all['Q50'].max()
-                    x_split1 = 1
-                    x_split2 = 10
-                    x_pct1 = 0.05
-                    x_pct2 = 0.10
-                    dict_to_plot[ax]['style'].extend([
-                        {'style_type': 'xscale', 'value': 'function', 'functions': plotter.create_3_linear_ax_scale(x_max, x_split1, x_split2, x_pct1, x_pct2)},
-                        {'style_type': 'xticks', 'ticks': [0, 1, 10, 50, 100, 150, 200, 250, 300]},
-                        {'style_type': 'xticklabels', 'labels': ['', '', '', '', '', '', '', '', '']},
-                    ])
-                    if clean:
-                        dict_to_plot[ax]['style'].extend([
-                            {'style_type': 'yticklabels', 'labels': []},
-                            {'style_type': 'ticks_params', 'labelleft': False}
-                        ])
-                    else:
-                        dict_to_plot[ax]['style'].extend([
-                            {'style_type': 'xlabel', 'label': 'Expected Annual Average |SHAP|'},
-                            {'style_type': 'xticklabels', 'labels': ['0', '1', '10', '50', '100', '150', '200', '250', '300']},
-                        ])
-                        
-                    # c
-                    ax = 'c'
-                    plotter.init_dic(dict_to_plot, ax, 'style')
-                    x_max = 75
-                    x_split1 = 10
-                    x_split2 = 50
-                    x_pct1 = 0.50
-                    x_pct2 = 0.80
-                    dict_to_plot[ax]['style'].extend([
-                        {'style_type': 'yscale', 'value': 'function', 'functions': plotter.create_3_linear_ax_scale(x_max, x_split1, x_split2, x_pct1, x_pct2)},
-                        {'style_type': 'yticks', 'ticks': [0, 10, 20, 30, 40, 50, 60, 70]},
-                        {'style_type': 'yticklabels', 'labels': ['', '', '', '', '', '', '', '']},
-                        {'style_type': 'ylim', 'ymin': 0, 'ymax': 75}
-                    ])
-                    if clean:
-                        dict_to_plot[ax]['style'].extend([
-                            {'style_type': 'xticklabels', 'labels': []},
-                            {'style_type': 'ticks_params', 'labelbottom': False}
-                        ])
-                    else:
-                        dict_to_plot[ax]['style'].extend([
-                            {'style_type': 'xlabel', 'label': 'Return Period (RP)'},
-                            {'style_type': 'ylabel', 'label': 'Share % of total |SHAP|'},
-                            {'style_type': 'yticklabels', 'labels': ['0', '10', '', '30', '', '50', '', '70']},
-                        ])
-                    
                     # Save
                     print(f"\n[STAGE 5. GSA] Preparing saving...")
                     gsa_target_path = Path(PATHS['gsa'])

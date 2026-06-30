@@ -33,7 +33,7 @@ else:
 # ==============================================================================
 # Set to True to execute the pipeline with lightweight mock data for testing.
 # Set to False to run the full methodology with large production datasets.
-USE_TEST_DATA = True  
+USE_TEST_DATA = False  
 # ==============================================================================
 
 # Define the root data directory based on the toggle switch
@@ -52,17 +52,12 @@ PATHS = {
     
     # Item prices (from webscraping)
     'prices_content': DATA_DIR / 'processed' / 'Prices_Content.xlsx',
-    'prices_continents': DATA_DIR / 'processed' / 'Prices_Contentinent.xlsx',
     
     # Depth samples (from HEC-RAS Monte Carlo)
-    'depth_samples': DATA_DIR / 'intermediate' / 'Depth_Samples.xlsx',
     'depth_samples_pkl': DATA_DIR / 'intermediate' / 'Depth_Samples.pkl',
     
     # Data functions (for Monte Carlo)
-    'fm_flow_xlsx': DATA_DIR / 'processed' / 'Functions_Input_Flow.xlsx',
-    'fm_xlsx': DATA_DIR / 'processed' / 'Functions_Main.xlsx',
     'fm_pkl': DATA_DIR / 'processed' / 'Functions_Main.pkl',
-    'fo_xlsx': DATA_DIR / 'processed' / 'Functions_Observed.xlsx',
     'fo_pkl': DATA_DIR / 'processed' / 'Functions_Observed.pkl',
     
     # HEC-RAS Configuration
@@ -70,7 +65,6 @@ PATHS = {
     'HR_sample_project': MODEL_DIR / 'HEC-RAS_6.6' / 'RC_1_Sample_Projects',
     'HR_output_maps': MODEL_DIR / 'HEC-RAS_6.6' / 'RC_2_Output_WSE',
     'HR_exe': Path(r"C:\Program Files (x86)\HEC\HEC-RAS\6.6\Ras.exe"),
-    'convergence_charts': OUTPUT_DIR / 'Convergence',
     
     # Buildings (Exposure Data)
     'buildings_shp': DATA_DIR / 'inputs' / 'gis' / 'BID' / 'BIDs_v2.3.shp',
@@ -84,14 +78,22 @@ PATHS = {
     'dem_error_tif': DATA_DIR / 'inputs' / 'Geostatistics' / 'Outputs' / 'kv1_se_c.tif',
     
     # Economic Monte Carlo (Resolves dynamically to the current user's home directory)
-    'dataset_mc_parts': Path.home() / 'Documents' / 'MC_Parts',
-    'fitted_distributions': DATA_DIR / 'processed' / 'PT_Fitted_Distributions',
+    'dataset_mc_parts': DATA_DIR / 'processed' / 'MC_Parts',
     
     # GSA XGBoost dataset
-    'xgb_dataset': DATA_DIR / 'processed' / 'xgb_dataset.parquet',
+    'xgb': DATA_DIR / 'processed' / 'MC_Parts' / 'XGBoost',
+    'xgb_dataset': DATA_DIR / 'processed' / 'MC_Parts' / 'XGBoost' / 'xgb_dataset.feather',
     
     # Docs for LLM
-    'llm_docs': BASE_DIR / 'docs' / 'llm'
+    'llm_docs': BASE_DIR / 'docs' / 'llm',
+    
+    # Figures
+    'convergence': OUTPUT_DIR / 'convergence',
+    'damage_map': OUTPUT_DIR / 'damage_map',
+    'damage_evolution': OUTPUT_DIR / 'damage_evolution',
+    'damage_functions': OUTPUT_DIR / 'damage_functions',
+    'ead_map': OUTPUT_DIR / 'ead_map',
+    'gsa': OUTPUT_DIR / 'gsa',
 }
 
 ### CODES

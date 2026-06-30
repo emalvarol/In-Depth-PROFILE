@@ -1,5 +1,5 @@
 """
-In-Depth-PROFILE Distribution preparation for economiv valuation Module
+In-Depth-PROFILE Distribution preparation for economic valuation Module
 
 This module handles the pre-treatment and probability distribution fitting 
 for the economic valuation model.
