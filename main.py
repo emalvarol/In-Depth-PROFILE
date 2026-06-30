@@ -122,14 +122,32 @@ def run_pipeline():
         sensitivity_engine.compute_and_group_shap_values()
     
     ## STAGE 5: Results
-    RUN = False
+    RUN = True
     if RUN:
-        from src.valuation.results import shap_results_grouper, DataPreparator, Plotter
-        ## GSA
+        from src.valuation.results import DataPreparator, Plotter
         
-        ## GSA
+        ## EAD
         RUN = False
         if RUN:
+            # Paths and Variables
+            output_gsa_dir = PATHS['ead_map']
+            
+            # fig_verion, re_run_grouping, clean = 2, False, True
+            def plot_ead_map(fig_version, clean=False):
+                ## Prepare data
+                print(f"\n[STAGE 5. EAD_Map] Preparing data...")
+                
+                full_df = DataPreparator.load_and_concatenate_mc_parts(
+                    PATHS['dataset_mc_parts'],
+                    ['SN', 'BID', 'RP', 'c_hu_bf'],
+                    "MC_Part")
+                
+                gdf_buildings = DataPreparator.load_flooded_buildings_gdf(PATHS['buildings_shp'], PATHS['depth_samples_pkl'])
+                
+        ## GSA
+        RUN = True
+        if RUN:
+            from src.valuation.results import shap_results_grouper
             # Paths and Variables
             output_gsa_dir = PATHS['xgb']
             RPs_unq = list(RETURN_PERIODS.keys())
@@ -140,9 +158,13 @@ def run_pipeline():
                 'IH': "#612c00", 'BH': "#a04800",
                 'GL': "#fd9744", 'Cga': "#ffb981",
                 'C.High': "#00b8a8",
+                'C.High_CTE': "#00b8a8", 'C.High_CTI': "#00b8a8",
                 'Prices': "#005eeb",
+                'Prices_CTE': "#005eeb", 'Prices_CTI': "#005eeb",
                 'Objects': "#2700b4",
-                'ed': "#ae00ff", 'Materials': "#ff0095",
+                'Objects_CTE': "#2700b4", 'Objects_CTI': "#2700b4",
+                'ed': "#ae00ff",
+                'Materials': "#ff0095", 'Materials_CTI': "#ff0095",
                 'Content': "#2de000",
                 'Continent': "#00751D",
             }
@@ -258,17 +280,356 @@ def run_pipeline():
                     column_names = df_shap_rp.columns.tolist()
                     
                     df_shap_rp.to_feather(shap_path)
+            
+            # Chart
+            RUN = True
+            if RUN:
+                # fig_verion, re_run_grouping, clean = 5, False, True
+                def plot_gsa(fig_version, clean=False):                    
+                    ## Prepare data
+                    print(f"\n[STAGE 5. GSA] Preparing data...")
+                    
+                    # Dataframes
+                    df_expected_l3_all = DataPreparator.calc_shap_expected_grouped(output_gsa_dir, RPs_unq, level=3, by_bid=False, min_rp_AEP_0=2)
+                    df_evolution_l3_all = DataPreparator.calc_shap_rp_evolution_grouped(output_gsa_dir, RPs_unq, level=3, by_bid=False)
+                    df_expected_l3_bid = DataPreparator.calc_shap_expected_grouped(output_gsa_dir, RPs_unq, level=3, by_bid=True, min_rp_AEP_0=2)
+                    gdf_buildings = DataPreparator.load_flooded_buildings_gdf(PATHS['buildings_shp'], PATHS['depth_samples_pkl'])
+                    
+                    # Geodataframes
+                    df_filtered = df_expected_l3_bid.reset_index()
+                    k_vars = len(df_filtered["Feature_Group"].unique())
+                    cumulative_threshold = 80
+                    acronym_map = {'he': 'he', 'C.High (hc_)': 'hc', 'Objects (n_)': 'n', 'Structure': 'S', 'Prices (p_)': 'p', 'ed': 'ed', 'Materials (m_)': 'm'}
+                    df_filtered = df_filtered[df_filtered['Q50'] > 0].copy()
+                    df_filtered = df_filtered.dropna(subset=['Q50'])
+                    df_filtered = df_filtered.sort_values(by=['BID', 'Q50_share_%'], ascending=[True, False])
+                    df_filtered['cumsum_share'] = df_filtered.groupby('BID')['Q50_share_%'].cumsum()
+                    df_filtered['prev_cumsum'] = df_filtered['cumsum_share'] - df_filtered['Q50_share_%']
+                    df_filtered = df_filtered[df_filtered['prev_cumsum'] < cumulative_threshold]
+                    
+                    df_map = df_filtered.groupby('BID').head(k_vars).copy()
+                    df_map['Short_Feature'] = df_map['Feature_Group'].map(lambda x: acronym_map.get(str(x).strip(), str(x).strip()))
 
+                    combinations = df_map.groupby('BID')['Short_Feature'].apply(lambda x: ' | '.join(x)).reset_index()
+                    combinations.rename(columns={'Short_Feature': f'Top_{cumulative_threshold}%_Combo'}, inplace=True)
+                    df_combo_counts = combinations[f'Top_{cumulative_threshold}%_Combo'].value_counts().reset_index()
+                    df_combo_counts.columns = [f'Top_{cumulative_threshold}%_Combo', 'BID_count']
+                    unique_combos = df_combo_counts[f'Top_{cumulative_threshold}%_Combo'].unique()
+                    
+                    def sort_hierarchical_combos(combos_list):
+                        """
+                        Sorts combinations hierarchically by frequency at each position, 
+                        placing longer combinations before shorter ones sharing the same prefix.
+                        """
+                        split_combos = [c.split(' | ') for c in combos_list]
+                        
+                        def _sort_recursive(items):
+                            if not items:
+                                return []
+                            
+                            counts = {}
+                            for item in items:
+                                if len(item) > 0:
+                                    counts[item[0]] = counts.get(item[0], 0) + 1
+                                    
+                            sorted_keys = sorted(counts.keys(), key=lambda x: (-counts[x], x))
+                            
+                            result = []
+                            for key in sorted_keys:
+                                continuations = [item[1:] for item in items if len(item) > 0 and item[0] == key and len(item) > 1]
+                                terminating = [item for item in items if len(item) > 0 and item[0] == key and len(item) == 1]
+                                
+                                sorted_continuations = _sort_recursive(continuations)
+                                
+                                for sub in sorted_continuations:
+                                    result.append([key] + sub)
+                                for _ in terminating:
+                                    result.append([key])
+                                    
+                            return result
+                        
+                        sorted_splits = _sort_recursive(split_combos)
+                        
+                        # Remove duplicates preserving order
+                        seen = set()
+                        final_combos = []
+                        for c in sorted_splits:
+                            combo_str = ' | '.join(c)
+                            if combo_str not in seen:
+                                seen.add(combo_str)
+                                final_combos.append(combo_str)
+                                
+                        return final_combos
+                    sorted_unique_combos = sort_hierarchical_combos(df_combo_counts[f'Top_{cumulative_threshold}%_Combo'].unique())
+                    df_combo_counts[f'Top_{cumulative_threshold}%_Combo'] = pd.Categorical(
+                        df_combo_counts[f'Top_{cumulative_threshold}%_Combo'], 
+                        categories=sorted_unique_combos, 
+                        ordered=True
+                    )
+                    df_combo_counts = df_combo_counts.sort_values(by=f'Top_{cumulative_threshold}%_Combo').reset_index(drop=True)
+                    total_BIDS = df_combo_counts["BID_count"].sum()
+                    df_combo_counts["BID_count_%"] = round((df_combo_counts["BID_count"] / total_BIDS * 100),1)
+                    
+                    num_combos = len(sorted_unique_combos)
+                    cmap_name = 'tab10' if num_combos <= 10 else 'tab20'
+                    cmap = plt.get_cmap(cmap_name)
+                    color_map = {combo: mcolors.to_hex(cmap(i % cmap.N)) for i, combo in enumerate(sorted_unique_combos)}
+                    combinations[f'Top_{cumulative_threshold}%_Combo'] = pd.Categorical(
+                        combinations[f'Top_{cumulative_threshold}%_Combo'], 
+                        categories=sorted_unique_combos, 
+                        ordered=True
+                    )
+                    combinations['combo_color'] = combinations[f'Top_{cumulative_threshold}%_Combo'].map(color_map)
+                    
+                    gdf_shap = gdf_buildings.merge(combinations, on='BID', how='inner')
+                    gdf_shap = gdf_shap.merge(df_map[df_map["Feature_Group"]=="he"], on='BID', how='inner')
+                    gdf_shap_centroids = gdf_shap.copy()
+                    gdf_shap_centroids['geometry'] = gdf_shap.centroid
+                    gdf_shap_centroids_4326 = gdf_shap_centroids.to_crs(epsg=4326)
+
+                    minx, miny, maxx, maxy = gdf_shap_centroids_4326.total_bounds
+                    buffer = 0.01
+                    plot_extent = [minx - buffer, maxx + buffer, miny - buffer, maxy + buffer]
+                    
+                    
+                    ## Prepare Plot
+                    print(f"\n[STAGE 5. GSA] Preparing layout...")
+                    # Plotter
+                    plotter = Plotter(
+                        config_paths=PATHS,
+                        config_codes=CODES,
+                        config_return_periods=RETURN_PERIODS
+                    )
+                    
+                    ## Layout
+                    layout_params = {
+                        'layout': 'mosaic',
+                        'mosaic_structure': [
+                            ["a", "a"],
+                            ["b", "c"],],
+                        'figsize': (6, 8),
+                        'kwargs': {'gridspec_kw': {
+                            'wspace': 0.1,
+                            'hspace': 0.1,
+                            'width_ratios': [0.5, 0.5],
+                            'height_ratios': [0.6, 0.4]}},
+                        'adjust': {'bottom': 0.1, 'top': 0.9, 'left': 0.1, 'right': 0.9}
+                    }
+                    dict_to_plot = {}
+                    
+                    ## Plots
+                    print(f"\n[STAGE 5. GSA] Preparing plots...")
+                    
+                    # a
+                    ax = 'a'
+                    plotter.init_dic(dict_to_plot, ax, 'plots')
+                    real_ratio = plotter.get_ax_ratio(layout_params, ax)
+                    top_left_x = (4, 42, 45)
+                    top_left_y = (40, 25, 00)
+                    zoom_pct = 120
+                    calc_extent_vals = plotter.calc_map_extent(top_left_x, top_left_y, zoom_pct, real_ratio)
+                    xmin, xmax, ymin, ymax = calc_extent_vals
+                    dict_to_plot[ax]['plots'].extend([
+                        {'plot_type': 'wms',
+                            'url': 'https://www.ign.es/wms-inspire/pnoa-ma?request=GetCapabilities&service=WMS',
+                            'layers': ['OI.OrthoimageCoverage'],
+                            'extent': plot_extent,
+                            'crs': 'EPSG:4326',
+                            'size': (1000, 1000),
+                            'alpha': 1,
+                            'zorder': 1
+                        },
+                        {'plot_type': 'gdf_shp',
+                            'gdf': gdf_shap_centroids_4326,
+                            'color': gdf_shap_centroids_4326['combo_color'].tolist(),
+                            'markersize': 2,
+                            'alpha': 1,
+                            'zorder': 3
+                        }
+                    ])
+                    if not clean:
+                        xmin, xmax, ymin, ymax = plot_extent
+                        legend_x = xmin + (xmax - xmin) * 0.02
+                        legend_y = ymax - (ymax - ymin) * 0.02
+                        y_step = (ymax - ymin) * 0.04
+                        
+                        dict_to_plot[ax]['plots'].append({
+                            'plot_type': 'text', 'x': legend_x, 'y': legend_y,
+                            'text': "Top 7 Variables Rank:", 'fontsize': 8, 'color': 'white',
+                            'ha': 'left', 'va': 'top', 'transform': 'data', 'fontweight': 'bold',
+                            'path_effects': [pe.withStroke(linewidth=2, foreground="black")], 'zorder': 5
+                        })
+                        
+                        # Changed from unique_combos to sorted_unique_combos
+                        for i, combo in enumerate(sorted_unique_combos):
+                            combo_color = color_map[combo]
+                            current_y = legend_y - ((i + 1) * y_step)
+                            
+                            dict_to_plot[ax]['plots'].append({
+                                'plot_type': 'text',
+                                'x': legend_x,
+                                'y': current_y,
+                                'text': f"■ {combo}",
+                                'color': combo_color,
+                                'fontsize': 6,
+                                'ha': 'left',
+                                'va': 'top',
+                                'transform': 'data',
+                                'path_effects': [pe.withStroke(linewidth=1, foreground="black")],
+                                'zorder': 5
+                            })
+
+                    # b
+                    ax = 'b'
+                    plotter.init_dic(dict_to_plot, ax, 'plots')
+                    bar_colors_b = []
+                    for grp in df_expected_l3_all.index:
+                        grp_str = str(grp)
+                        # Base color from the prefix (e.g., Prices, Materials)
+                        base_name = grp_str.split('_CT')[0].strip()
+                        bar_colors_b.append(gsa_group_colors.get(base_name, '#cccccc'))
+                    dict_to_plot[ax]['plots'].append({
+                        'plot_type': 'barh',
+                        'y': df_expected_l3_all.index.tolist(),
+                        'width': df_expected_l3_all['Q50'].values,
+                        'color': bar_colors_b,
+                        'alpha': 1,
+                        'reverse': True
+                    })
+                    if not clean:
+                        for idx, row in df_expected_l3_all.iterrows():
+                            dict_to_plot[ax]['plots'].append({
+                                'plot_type': 'text', 'x': row['Q50'], 'y': idx,
+                                'text': f" {row['Q50_share_%']:.2f}%", 'transform': 'data',
+                                'va': 'center', 'ha': 'left', 'fontsize': 8, 'color': 'black'
+                            })
+
+                    # c
+                    ax = 'c'
+                    plotter.init_dic(dict_to_plot, ax, 'plots')
+                    share_cols = [col for col in df_evolution_l3_all.columns if col.startswith('Share_%_RP')]
+                    rps_numeric = [int(col.replace('Share_%_RP', '')) for col in share_cols]
+                    sorted_idx = np.argsort(rps_numeric)
+                    share_cols_sorted = [share_cols[i] for i in sorted_idx]
+                    rps_categorical = [str(rps_numeric[i]) for i in sorted_idx]
+                    for feature_name, row in df_evolution_l3_all.iterrows():
+                        feat_color = gsa_group_colors.get(feature_name, '#cccccc')
+                        y_shares = row[share_cols_sorted].values
+                        dict_to_plot[ax]['plots'].append({
+                            'plot_type': 'line', 
+                            'x': rps_categorical, 
+                            'y': y_shares, 
+                            'color': feat_color, 
+                            'marker': 'o', 
+                            'markersize': 3, 
+                            'linewidth': 1.5, 
+                            'label': feature_name
+                        })
+                    
+                    # Style
+                    print(f"\n[STAGE 5. GSA] Preparing style...")
+                    # a
+                    ax = 'a'
+                    plotter.init_dic(dict_to_plot, ax, 'style')
+                    label_vis = not clean  # Determines if top/left labels are shown
+                    dict_to_plot[ax]['style'].extend([
+                        {'style_type': 'grid', 'visible': True, 'linestyle': '--', 'alpha': 0.3, 'zorder': 1},
+                        {'style_type': 'xlim', 'left': calc_extent_vals[0], 'right': calc_extent_vals[1]},
+                        {'style_type': 'ylim', 'bottom': calc_extent_vals[2], 'top': calc_extent_vals[3]},
+                        {'style_type': 'aspect', 'aspect': 'equal'},
+                        {'style_type': 'spines', 'top': True, 'right': True, 'left': True, 'bottom': True},
+                        {'style_type': 'ticks_params', 'which': 'both', 'labelsize': 8,
+                            'top': True, 'bottom': False, 'left': True, 'right': False,
+                            'labeltop': label_vis, 'labelbottom': False, 'labelleft': label_vis, 'labelright': False},
+                        {'style_type': 'ticks_params', 'axis': 'y', 'labelrotation': 90},
+                        {'style_type': 'yticklabels', 'va': 'center'},
+                        {'style_type': 'major_formatter', 'axis': 'y', 'formatter_type': 'dms_suffix', 'suffix': ' N'},
+                        {'style_type': 'major_formatter', 'axis': 'x', 'formatter_type': 'dms_suffix', 'suffix': ' W'},
+                    ])
+                    if clean:
+                        dict_to_plot[ax]['style'].extend([
+                            {'style_type': 'xticklabels', 'labels': []},
+                            {'style_type': 'yticklabels', 'labels': []}
+                        ])
+                    else:
+                        dict_to_plot[ax]['style'].extend([
+                            {'style_type': 'legend', 'loc': 'upper right', 'fontsize': 5, 'title': 'Top 7 Variables Rank'}
+                        ])
+
+                    # b
+                    ax = 'b'
+                    plotter.init_dic(dict_to_plot, ax, 'style')
+                    x_max = df_expected_l3_all['Q50'].max()
+                    x_split1 = 1
+                    x_split2 = 10
+                    x_pct1 = 0.05
+                    x_pct2 = 0.10
+                    dict_to_plot[ax]['style'].extend([
+                        {'style_type': 'xscale', 'value': 'function', 'functions': plotter.create_3_linear_ax_scale(x_max, x_split1, x_split2, x_pct1, x_pct2)},
+                        {'style_type': 'xticks', 'ticks': [0, 1, 10, 50, 100, 150, 200, 250, 300]},
+                        {'style_type': 'xticklabels', 'labels': ['', '', '', '', '', '', '', '', '']},
+                    ])
+                    if clean:
+                        dict_to_plot[ax]['style'].extend([
+                            {'style_type': 'yticklabels', 'labels': []},
+                            {'style_type': 'ticks_params', 'labelleft': False}
+                        ])
+                    else:
+                        dict_to_plot[ax]['style'].extend([
+                            {'style_type': 'xlabel', 'label': 'Expected Annual Average |SHAP|'},
+                            {'style_type': 'xticklabels', 'labels': ['0', '1', '10', '50', '100', '150', '200', '250', '300']},
+                        ])
+                        
+                    # c
+                    ax = 'c'
+                    plotter.init_dic(dict_to_plot, ax, 'style')
+                    x_max = 75
+                    x_split1 = 10
+                    x_split2 = 50
+                    x_pct1 = 0.50
+                    x_pct2 = 0.80
+                    dict_to_plot[ax]['style'].extend([
+                        {'style_type': 'yscale', 'value': 'function', 'functions': plotter.create_3_linear_ax_scale(x_max, x_split1, x_split2, x_pct1, x_pct2)},
+                        {'style_type': 'yticks', 'ticks': [0, 10, 20, 30, 40, 50, 60, 70]},
+                        {'style_type': 'yticklabels', 'labels': ['', '', '', '', '', '', '', '']},
+                        {'style_type': 'ylim', 'ymin': 0, 'ymax': 75}
+                    ])
+                    if clean:
+                        dict_to_plot[ax]['style'].extend([
+                            {'style_type': 'xticklabels', 'labels': []},
+                            {'style_type': 'ticks_params', 'labelbottom': False}
+                        ])
+                    else:
+                        dict_to_plot[ax]['style'].extend([
+                            {'style_type': 'xlabel', 'label': 'Return Period (RP)'},
+                            {'style_type': 'ylabel', 'label': 'Share % of total |SHAP|'},
+                            {'style_type': 'yticklabels', 'labels': ['0', '10', '', '30', '', '50', '', '70']},
+                        ])
+                    
+                    # Save
+                    print(f"\n[STAGE 5. GSA] Preparing saving...")
+                    gsa_target_path = Path(PATHS['gsa'])
+                    save_params = {
+                        'output_dir': str(gsa_target_path),  # Saves in output/gsa/ folder dynamically
+                        'subfolder': '',
+                        'fname': f"{gsa_target_path.name}_v{fig_version}.png",
+                        'show': False,
+                        'dpi': 300,
+                    }
+
+                    # 3. Execute Plot Rendering via the Engine
+                    print(f"\n[STAGE 5. GSA] Running plot any...")
+                    plotter.plot_any(layout_params, dict_to_plot, save_params)
+                    
+                plot_gsa(fig_version="5", clean=False)
+                plot_gsa(fig_version="5.c", clean=True)    
+
+                    
             # Charts
             RUN = False
             if RUN:
                 # fig_verion, re_run_grouping, clean = 4.4, False, True
-                def plot_gsa_charts_sensitivity_analysis(fig_version, clean=False):
-                    """
-                    Builds the configuration dictionaries for the GSA mosaic plot and passes them
-                    to the Plotter engine.
-                    """
-                    
+                def plot_gsa_charts_sensitivity_analysis(fig_version, clean=False):                    
                     ## Prepare data
                     print(f"\n[STAGE 5. GSA] Preparing data...")                   
                                     
@@ -548,12 +909,7 @@ def run_pipeline():
                     ## Prepare data
                     print(f"\n[STAGE 5. GSA] Preparing data...")
                     # 1. Load Needed Data
-                    gdf_buildings = gpd.read_file(PATHS['buildings_shp'])
-                    df_depth_samples = pd.read_pickle(PATHS['depth_samples_pkl'])
-                    BIDs_flooded = df_depth_samples.groupby('BID')['he'].transform('max') > 0 # At least in one RP
-                    df_depth_samples = df_depth_samples[BIDs_flooded].reset_index(drop=True) # from 5722880 to 4689280 rows
-                    BIDs_flooded_unq = df_depth_samples['BID'].unique()
-                    gdf_buildings = gdf_buildings[gdf_buildings['BID'].isin(BIDs_flooded_unq)].copy()                
+                    gdf_buildings = DataPreparator.load_flooded_buildings_gdf(PATHS['buildings_shp'], PATHS['depth_samples_pkl'])
                     
                     # 4. Load Expected SHAP Data
                     df_expected_l3_bid = DataPreparator.calc_shap_expected_grouped(output_gsa_dir, RPs_unq, level=3, by_bid=True, min_rp_AEP_0=2)
@@ -561,7 +917,7 @@ def run_pipeline():
                     # 7. Map Setup & Geographic Combos
                     df_filtered = df_expected_l3_bid.reset_index()
                     k_vars = len(df_filtered["Feature_Group"].unique())
-                    cumulative_threshold = 80
+                    cumulative_threshold = 90
                     acronym_map = {'he': 'he', 'C.High (hc_)': 'hc', 'Objects (n_)': 'n', 'Structure': 'S', 'Prices (p_)': 'p', 'ed': 'ed', 'Materials (m_)': 'm'}
                     df_filtered = df_filtered[df_filtered['Q50'] > 0].copy()
                     df_filtered = df_filtered.dropna(subset=['Q50'])

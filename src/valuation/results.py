@@ -105,6 +105,16 @@ class DataPreparator:
         return df
     
     @staticmethod
+    def load_flooded_buildings_gdf(building_path, depth_samples_path):
+        gdf_buildings = gpd.read_file(building_path)
+        df_depth_samples = pd.read_pickle(depth_samples_path)
+        BIDs_flooded = df_depth_samples.groupby('BID')['he'].transform('max') > 0
+        df_depth_samples = df_depth_samples[BIDs_flooded].reset_index(drop=True)
+        BIDs_flooded_unq = df_depth_samples['BID'].unique()
+        gdf_buildings = gdf_buildings[gdf_buildings['BID'].isin(BIDs_flooded_unq)].copy()
+        return gdf_buildings
+    
+    @staticmethod
     def calc_hr_convergence(self, df, rp_key, threshold=0.1, z_score=1.96):
         """
         Calculates convergence metrics for a specific Return Period.
