@@ -3,7 +3,7 @@ In-Depth PRobabilistic Object-oriented Framework for Inundation Loss Estimation.
 A framework result of an extension of Acharya et al. (2025) and Dottori et al. (2016) originally wrote in R lenguage. This framework integrates all steps neccesary to develope a Stochastic Flood Loss model considering: (1) HEC-RAS Monte Carlo Modelling; (2) survey data management; (3) web scraping for prices; (4) economic Monte Carlo; (4) convergence analysis; (5) sensitivity analysis though XGBoost subrogated model and SHAP calculation.
 
 ## NOTE!
-This repository is part of an active research. We are in process of writting and plublishing the manuscript. Furthermore, this repository was build after the research process and the code has been changed during the creation of this repository. Due this unplanned workflow the repository may contain bugs which will be fixed according our possibilities.
+This repository is part of an active research. We are in process of writting and plublishing the manuscript. Furthermore, this repository was build after the research process and the code has been changed during the creation of this repository. The original code is included on src/deprecated, and this repository may contain bugs.
 
 ## Structure
 ### Structure of this repository:
@@ -28,13 +28,8 @@ In-Depth-PROFILE/
 │       └── results.py              <- Figure creation
 │
 ├── data/                           <- Data directory (tracked files only; large files ignored)
-│   ├── raw/                        <- E.g., survey data, uncorrected DSMs
-│   ├── processed/                  <- E.g., scraped prices, fitted distributions
-│   └── GIS_Inputs/                 <- Shapefiles, Cadastre data, Corine Land Cover
 │
 ├── models/                         <- External model configurations
-│   ├── HEC-RAS_6.6./               <- Base and sample HEC-RAS projects
-│   └── XGBoost/                    <- Trained surrogate models (if small enough)
 │
 ├── outputs/                        <- Generated results (tracked as examples)
 │   ├── figures/                    <- Damage maps, convergence charts, SHAP plots
@@ -55,7 +50,7 @@ In-Depth-PROFILE/
 ### Notes:
 1. This repository and python code is not a python library neither a fully automatic pip-line, rather it is a worspace to use dynamicly on a code editor such as Visual Studio Code together with Conda environment. All workflow can be done trough main.py
 
-2. Large files used in the process are ommited on this repository. Instead they are updated as part of the research on: ... (free download available)
+2. Large files used in the process (`data/` and `models/`) are ommited on this repository. They can be found as part of the research on Zenodo.
 
 ## Requirements & Environments
 ### Overview
@@ -102,14 +97,16 @@ conda activate env_b
 
 ## Strenghts and Limitations
 What can and what can not be done with this repository
+
 ### Web Scraping
 scraping.py module contains the EconomicScraper and PriceDataCleaner classes. They were prepared to scrape multiple items on two general retailers with modern webpages and limitations. They use of playwright was mandatory to overpass those limitation. Please note the use of web scraping its delicated and may lead to legal concerns. The data scraped for this research was limited and used for that propose.
 
 ### HEC-RAS Monte Carlo
-modeling.py module contains HydrologicalFitter, GeospatialProcessor and HecRasMonteCarloEngine classes. They allow a fully automation of HEC-RAS launches, including the sample of the water depth outside the buildings. Its relay heavely on Ras Commander library (https://github.com/gpt-cmdr/ras-commander). This (amazing) library is still on development and may change. Further a new modern version of HEC-RAS is being developed and will may simply this stage.
+modeling.py module contains HydrologicalFitter, GeospatialProcessor and HecRasMonteCarloEngine classes. They allow a fully automation of HEC-RAS launches, including the sample of the water depth outside the buildings. Its relay heavely on Ras Commander library (https://github.com/gpt-cmdr/ras-commander). This library is still on development and may change. Further a new modern version of HEC-RAS is being developed and will may simplify this stage.
 
 ### Input uncertainties distribution fitting
-preparation.py module contains the DistributionFitter class. An stochastics or uncertainty analysis involve defining the distribution of each input with available data. To do so the mentioned class allow doing bootstrap across many specified functions to use survey data to create the input distribution. It heavy relay on scipy library. Alternativelly, the user can directly create the fm_pkl and fo_pkl object defining the functions name and params according to scipy.
+preparation_old.py module contains the DistributionFitter class. An stochastics or uncertainty analysis involve defining the distribution of each input with available data. To do so the mentioned class allow doing bootstrap across many specified functions to use survey data to create the input distribution. It heavy relay on scipy library. Alternativelly, the user can directly create the fm_pkl and fo_pkl object defining the functions name and params according to scipy.
+a newer preparation.py module is included, which does the same but using a new library named mocaloss we are development to simplify the use of the framework.
 
 ### Economic Monte-Carlo
 execution.py module contains the LossModelExecutionEngine class. This is the adaptation to python and extension of the work developed by Acharya et al. (2025) and Dottori et al. (2016). It works with a defined dataset including all the input variables, its distributions, its relationships and calculations and automatically executes a monte carlo process using vectorized samples, calculations and paralellization. It can handle multiple return periods, multiple buildings and building type, multiple distributions, missing distribution with fallback logic, multiple building floors and more.

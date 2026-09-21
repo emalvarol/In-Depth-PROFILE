@@ -58,7 +58,8 @@ def run_pipeline():
             from src.modeling import HecRasMonteCarloEngine
             engine = HecRasMonteCarloEngine(PATHS, RETURN_PERIODS, RST)
             engine.run_monte_carlo()
-          
+            engine.get_representative_floods()
+            
     ## STAGE 3: Economic Valuation
     RUN = False
     if RUN:
@@ -68,46 +69,32 @@ def run_pipeline():
         if RUN:
             print("### STAGE 3: Fit Data ###")
             from src.valuation.preparation import DistributionFitter
-            pandarallel.initialize(progress_bar=True)
-            fitter = DistributionFitter(PATHS, CODES, RETURN_PERIODS, DIST_CATALOG)
-            df_survey_long, df_prices, df_depth_samples, gdf_buildings = fitter.load_input_data()
-            fitter.prepare_building_distributions(
-                var_to_fit = ["BT", "NF", "BF", "HU", "IH", "GL", "BH", "Cga"])
-            fitter.prepare_content_distributions(
-                var_to_fit=["n_CTE", "p_CTE", "ff_CTE"]
-            )
-            fitter.prepare_continent_distributions(
-                var_to_fit=[
-                    "p_PUM", "p_DHU", "p_CLE", 
-                    "p_SOI", "m_SOI", "ff_SOI", 
-                    "pr_PRW", "m_PRW", "ff_PRW", "p_PRW", 
-                    "p_ETP", "m_EXF", "ff_FRI", "n_FRI", 
-                    "p_SKT", "n_SKT", "m_SKT", "ff_SKT", 
-                    "p_RDR", "n_RDR", "m_RDR", "ff_RDR", 
-                    "p_WND", "n_WND", "ff_WND", 
-                    "p_PLG", "n_PLG", "ff_PLG", 
-                    "p_ELS", "t_ELS"
-                ]
-            )
-            fitter.prepare_event_features_distributions(
-                var_to_fit=["he"]
-            )
-            fitter.prepare_dem_error_distributions(
-        var_to_fit=["ed"]
-    )
+            
+            # NOTE: This a newer implementation example using mocaloss library
+            # sampling_table_v1.4.pkl is already populated, original fit from survey
+            # was done with preparation_old.py, maintained for crosscomparision
+            
+            # Initialize the fitter class
+            fitter = DistributionFitter(PATHS, CODES, RETURN_PERIODS, DIST_CATALOG,)
+            
+            # Prepare and save sampling rules
+            fitter.fit_hazard() 
+            fitter.complete_sampling_rules()
+            fitter.save() 
 
         # 2. Run Loss Model
         RUN = False
         if RUN:
             print("### STAGE 3: Run Loss Model ###")
             from src.valuation.execution import LossModelExecutionEngine
+            
+            # NOTE: This is a newer implementation done with mocaloss
+                
+            # 1. Initialize the engine class
             engine = LossModelExecutionEngine(PATHS, CODES, RETURN_PERIODS)
-            dataset, col_name_dic = engine.create_base_dataset(gdf_buildings=gpd.read_file(PATHS['buildings_shp']))
-            engine.run_economic_monte_carlo(
-                n_simulations=10000, 
-                cores=16, 
-                batch_size=128
-            )
+            
+            # 2. Run mocaloss model
+            engine.run_model()
             
     ## STAGE 4: Sensitivity Analysis
     RUN = False
@@ -122,7 +109,7 @@ def run_pipeline():
         sensitivity_engine.compute_and_group_shap_values()
     
     ## STAGE 5: Results
-    RUN = True
+    RUN = False
     if RUN:
         from src.valuation.results import DataPreparator, Plotter
         

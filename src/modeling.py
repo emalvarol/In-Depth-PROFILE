@@ -52,7 +52,7 @@ class HydrologicalFitter:
         Initializes the fitter with centralized framework paths.
         """
         self.paths = config_paths
-        self.output_path = self.paths['fm_pkl']
+        self.output_path = self.paths['fm_flow_pkl']
 
     @staticmethod
     def _fit_pearson3(x_vals, tail_percentile=0.05):
@@ -195,7 +195,7 @@ class HecRasMonteCarloEngine:
         self.p_upper = 0.95
         
         # HEC-RAS Model settings
-        self.n_rows_unsteady = 7 
+        self.n_rows_unsteady = 10 
         
         # Convergence Settings
         self.threshold = 0.1
@@ -207,23 +207,59 @@ class HecRasMonteCarloEngine:
 
     @staticmethod
     def _remove_readonly(func, path, excinfo):
-        """Error handler for shutil.rmtree to remove read-only attributes."""
+        """Error handler for shutil.rmtree to remove read-only attributes.
+        Supports both Python <3.12 (onerror) and >=3.12 (onexc)."""
         os.chmod(path, stat.S_IWRITE)
         func(path)
     
     def _manage_worker_folders(self):
         """Cleans and initializes isolated workspaces for worker threads."""
         worker_paths = []
+        base_proj = self.paths['HR_base_project']
+
+        #print("\n--- [DEBUG] Starting Worker Workspace Initialization ---")
+        #print(f"[DEBUG] Base Project Directory: {base_proj}")
+
+        # Check source base folder for critical .hdf files
+        if os.path.exists(base_proj):
+            base_files = os.listdir(base_proj)
+            hdf_files = [f for f in base_files if f.endswith('.hdf')]
+            #print(f"[DEBUG] Files in base folder ({len(base_files)} total): {base_files}")
+            #print(f"[DEBUG] .hdf files found in base folder: {hdf_files}")
+        else:
+            #print(f"[ERROR] Base project path does NOT exist: {base_proj}")
+            pass
+        
         for i in range(1, self.phy_cores + 1):
             dest_path = os.path.join(self.paths['HR_sample_project'], f'Worker_{i}')
             
+            # Remove old folder using flexible error handler to ensure full deletion
             if os.path.exists(dest_path):
-                shutil.rmtree(dest_path, onexc=self._remove_readonly)
+                try:
+                    shutil.rmtree(dest_path, onexc=self._remove_readonly)
+                except TypeError:
+                    # Fallback for Python < 3.12
+                    shutil.rmtree(dest_path, onerror=self._remove_readonly)
             
-            shutil.copytree(self.paths['HR_base_project'], dest_path)
+            # Copy base project to worker folder
+            shutil.copytree(base_proj, dest_path)
             worker_paths.append(dest_path)
+
+            # Verification of copy action
+            worker_files = os.listdir(dest_path)
+            target_hdf = [f for f in worker_files if f.endswith('.hdf')]
             
+            #print(f"[DEBUG] Worker_{i} created at: {dest_path}")
+            #print(f"        -> Total items copied: {len(worker_files)}")
+            #print(f"        -> .hdf files present: {target_hdf}")
+
+            # Specific check for missing HDF condition
+            if not target_hdf:
+                #print(f"[WARNING] Worker_{i} is missing .hdf files after copytree!")
+                pass
+
         os.makedirs(self.paths['HR_output_maps'], exist_ok=True)
+        #print("--- [DEBUG] Workspace Initialization Complete ---\n")
         return worker_paths
 
     @staticmethod
@@ -356,7 +392,8 @@ class HecRasMonteCarloEngine:
                 p_dist = dist_depth_df[dist_depth_df['ReturnPeriod'] == rp_key].iloc[0]
                 fw_samples = self.sample_lhs_truncated(
                     p_dist['Skew'], p_dist['Loc'], p_dist['Scale'], size=self.phy_cores, p_range=(self.p_lower, self.p_upper))
-
+                print("flow inputs generated")
+                
                 # Prepare parameters and boundary condition files per thread
                 last_sn = self._get_latest_sn(rp_key)
                 task_inputs = []
@@ -371,7 +408,8 @@ class HecRasMonteCarloEngine:
                         'num_cores': self.hr_cores_by_sim,
                         'gdf': gdf_buildings
                     })
-
+                print("Unsteady file updated")
+                
                 # Process concurrent execution blocks
                 all_results_list = []
                 for idx in range(0, len(task_inputs), self.hr_parallel_sims):
@@ -380,7 +418,8 @@ class HecRasMonteCarloEngine:
                         block_results = pool.map(_mp_hydraulic_worker, block)
                         for sim_metrics in block_results:
                             all_results_list.extend(sim_metrics)
-
+                print("Simulation executed")
+                
                 # Relocate and format spatial rasters (.tif outputs)
                 for i, path in enumerate(worker_paths):
                     sim_sn = last_sn + i + 1
@@ -408,7 +447,49 @@ class HecRasMonteCarloEngine:
                 print("--------------------------------------------\n")
         
         print("HEC-RAS Monte Carlo Engine executed and converged successfully.")
-   
+
+    def get_representative_floods(self):
+        # 1. Find representative model outputs and save them appart
+        depth_df = pd.read_pickle(self.paths["depth_samples_pkl"])
+        unique_if = depth_df[['RP', 'SN', 'IF']].drop_duplicates()
+        
+        closest_sn = {}
+        for rp, (q05, q50, q95) in self.return_periods.items():
+            sub = unique_if[unique_if['RP'] == rp]
+            
+            if sub.empty:
+                continue
+
+            # Find the SN for each quantile target by minimizing absolute difference
+            sn_q05 = sub.loc[(sub['IF'] - q05).abs().idxmin(), 'SN']
+            sn_q50 = sub.loc[(sub['IF'] - q50).abs().idxmin(), 'SN']
+            sn_q95 = sub.loc[(sub['IF'] - q95).abs().idxmin(), 'SN']
+
+            closest_sn[rp] = {
+                'Q05': int(sn_q05),
+                'Q50': int(sn_q50),
+                'Q95': int(sn_q95)
+            }
+        
+        output_modeled_floods_dir = self.paths["modeled_floods"]
+        output_modeled_floods_dir.mkdir(parents=True, exist_ok=True)
+        
+        copied_files = []
+        for rp, quantiles in closest_sn.items():
+            for q_label, sn in quantiles.items():
+                # Source filename: WSE_RP5_SN1.tif
+                source_file = self.paths["HR_output_maps"] / f"WSE_RP{rp}_SN{sn}.tif"
+                
+                # Destination filename with suffix: WSE_RP5_SN1_Q05.tif
+                dest_file = output_modeled_floods_dir / f"WSE_RP{rp}_SN{sn}_{q_label}.tif"
+                
+                if source_file.exists():
+                    shutil.copy2(source_file, dest_file)
+                    copied_files.append(dest_file)
+                    print(f"Copied: {source_file.name} -> {dest_file.name}")
+                else:
+                    print(f"Warning: File not found -> {source_file}")
+        
 # ==============================================================================
 # GLOBAL MULTIPROCESSING WORKER
 # Must remain at module level for pickling compatibility

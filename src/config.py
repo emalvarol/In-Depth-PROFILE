@@ -48,23 +48,33 @@ print(f"[{'TESTING' if USE_TEST_DATA else 'PRODUCTION'} MODE] Output directory s
 ### PATHS
 PATHS = {
     # Data survey
-    'survey': DATA_DIR / 'inputs' / 'S1_Survey(v2022)_long_clean_en_v2.1.xlsx',
+    'survey': DATA_DIR / 'inputs' / 'Formulario_encuestas(v2022)_long_clean_v2.1.xlsx',
     
     # Item prices (from webscraping)
     'prices_content': DATA_DIR / 'processed' / 'Prices_Content.xlsx',
     
-    # Depth samples (from HEC-RAS Monte Carlo)
+    # Depth samples (for/from HEC-RAS Monte Carlo)
+    'fm_flow_pkl': DATA_DIR / 'intermediate' / 'Flow_Fitted_Functions.pkl',
     'depth_samples_pkl': DATA_DIR / 'intermediate' / 'Depth_Samples.pkl',
     
-    # Data functions (for Monte Carlo)
-    'fm_pkl': DATA_DIR / 'processed' / 'Functions_Main.pkl',
-    'fo_pkl': DATA_DIR / 'processed' / 'Functions_Observed.pkl',
+    # NEW! mocaloss
+    'mocaloss_working_dir' : DATA_DIR / 'mocaloss',
+    'sampling_rules_name' : "sampling_table_v1.4.pkl",
+    
+    # NEW! Official floods
+    'det_RP10' : DATA_DIR / 'inputs' / "gis" / "OficialFloods" / "Q10_2Ciclo_PB_2026_Navaluenga.shp",
+    'det_RP50' : DATA_DIR / 'inputs' / "gis" / "OficialFloods" / "Q50_2Ciclo_PB_2026_Navaluenga.shp",
+    'det_RP100' : DATA_DIR / 'inputs' / "gis" / "OficialFloods" / "Q100_2Ciclo_PB_2026_Navaluenga.shp",
+    'det_RP500' : DATA_DIR / 'inputs' / "gis" / "OficialFloods" / "Q500_2Ciclo_PB_2026_Navaluenga.shp",
     
     # HEC-RAS Configuration
     'HR_base_project': MODEL_DIR / 'HEC-RAS_6.6' / 'RC_0_Base_Project',
     'HR_sample_project': MODEL_DIR / 'HEC-RAS_6.6' / 'RC_1_Sample_Projects',
     'HR_output_maps': MODEL_DIR / 'HEC-RAS_6.6' / 'RC_2_Output_WSE',
     'HR_exe': Path(r"C:\Program Files (x86)\HEC\HEC-RAS\6.6\Ras.exe"),
+    
+    # NEW! Modeled floods
+    'representative_floods' : DATA_DIR / 'intermediate' / "gis" / "ModeledFloods",
     
     # Buildings (Exposure Data)
     'buildings_shp': DATA_DIR / 'inputs' / 'gis' / 'BID' / 'BIDs_v2.3.shp',
@@ -83,9 +93,6 @@ PATHS = {
     # GSA XGBoost dataset
     'xgb': DATA_DIR / 'processed' / 'MC_Parts' / 'XGBoost',
     'xgb_dataset': DATA_DIR / 'processed' / 'MC_Parts' / 'XGBoost' / 'xgb_dataset.feather',
-    
-    # Docs for LLM
-    'llm_docs': BASE_DIR / 'docs' / 'llm',
     
     # Figures
     'convergence': OUTPUT_DIR / 'convergence',
@@ -220,14 +227,14 @@ CODES = {
 
 ### RETURN PERIODS
 RETURN_PERIODS = {
-    #2:    [106,   147,    203], # Excluded from the analysis, any damage generated.
-    5:    [244,   340,    507],
-    10:   [367,   526,    877],
-    20:   [552,   838,    1686],
-    50:   [707,   1132,   2671],
-    100:  [871,   1483,   4136],
-    200:  [1044,  1898,   6288],
-    500:  [1284,  2560,   10710],
+    #2:    [115,   159,    219], # Excluded from the analysis, any damage generated.
+    5:    [279,   399,    570],
+    10:   [442,   644,    980],
+    25:   [652,   1075,   1796],
+    50:   [850,   1493,   2663],
+    100:  [1082,  2007,   3800],
+    200:  [1347,  2638,   5275],
+    500:  [1751,  3671,   7908],
 }
 
 ### DISTRIBUTIONS
@@ -347,5 +354,5 @@ DIST_CATALOG = {
 
 ### HEC-RAS
 RST = [ # Restart Files flow m3/s
-    90, 250, 500, 750, 1000, 1250, 1500, 2000, 2500, 3000, 5000, 7000, 9000
+    90, 250, 500, 750, 1000, 1250, 1500, 2000, 2500, 3000, 5000, 7000
 ]
