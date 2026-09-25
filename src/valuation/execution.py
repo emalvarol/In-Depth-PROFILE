@@ -86,7 +86,7 @@ class LossModelExecutionEngine:
 
         # 2. Model Stage
         # Model
-        model = mcl.Model(max_iterations=5_000, working_dir=self.paths['mocaloss_working_dir'], measure_time=True)
+        model = mcl.Model(max_iterations=11_100, working_dir=self.paths['mocaloss_working_dir'], measure_time=True)
         model.add_base_dataframe(df_buildings)
         model.add_explosion(new_col="RP", target_col="BID", mapping=rp_mapping)
         model.add_explosion(new_col="FID", bounds=["BF", "NF"], lower_bound_default_value = 0)
@@ -124,7 +124,15 @@ class LossModelExecutionEngine:
             hi_expr_logic(),
             
             # Fragility function aplication to identify damaged items
-            *[(pl.col(f"bp_{comp}") <= pl.col(f"f_{comp}")).cast(pl.Int8).alias(f"d_{comp}") for comp in content_list + continent_list_items + continent_list_general],
+           *[
+                pl.when(pl.col("hi") > 0)
+                .then(
+                    (pl.col(f"bp_{comp}") <= pl.col(f"f_{comp}")).cast(pl.Int8)
+                )
+                .otherwise(0)
+                .alias(f"d_{comp}")
+                for comp in content_list + continent_list_items + continent_list_general
+            ],
             
             # Calculation of extensions
             pl.when(pl.col("d_SOI") == 1).then(area_expr).otherwise(0.0).alias("e_SOI"),
@@ -181,7 +189,8 @@ class LossModelExecutionEngine:
             tolerance_type="relative",
             tolerance_value=0.05,
             significance_level=0.05,
-            check_frequency=50
+            first_check_point=100,
+            check_frequency=1000
         )
 
         # Summary

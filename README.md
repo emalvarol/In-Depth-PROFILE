@@ -3,7 +3,7 @@ In-Depth PRobabilistic Object-oriented Framework for Inundation Loss Estimation.
 A framework result of an extension of Acharya et al. (2025) and Dottori et al. (2016) originally wrote in R lenguage. This framework integrates all steps neccesary to develope a Stochastic Flood Loss model considering: (1) HEC-RAS Monte Carlo Modelling; (2) survey data management; (3) web scraping for prices; (4) economic Monte Carlo; (4) convergence analysis; (5) sensitivity analysis though XGBoost subrogated model and SHAP calculation.
 
 ## NOTE!
-This repository is part of an active research. We are in process of writting and plublishing the manuscript. Furthermore, this repository was build after the research process and the code has been changed during the creation of this repository. The original code is included on src/deprecated, and this repository may contain bugs.
+This repository containg all script used during the process including changes we did during the process. main.py contains the main workflow and usage notes. The original code is included on src/deprecated. This repository may contain bugs. However, a new library named mocaloss (MOnte CArlo LOSS Model) is being developed to simplify the usage and generalize the core stages (fitting, convergence, economic monte carlo, sensitivity analysis, and result processing)
 
 ## Structure
 ### Structure of this repository:
@@ -20,6 +20,7 @@ In-Depth-PROFILE/
 │   ├── config.py                   <- Dynamic pathing, global dictionaries, and setups
 │   ├── scraping.py                 <- Web scraping and market price data mining
 │   ├── modeling.py                 <- HEC-RAS automation and Monte Carlo hazard engine
+│   ├── deprecated/                 <- Original script used and early versions
 │   └── valuation/                  <- Loss valuation engine (INSYDE Core)
 │       ├── __init__.py
 │       ├── preparation.py          <- Preprocessing (spatial joins, land registries)
@@ -27,28 +28,18 @@ In-Depth-PROFILE/
 │       ├── sensitivity.py          <- Global Sensitivity Analysis (GSA) module for SHAP
 │       └── results.py              <- Figure creation
 │
-├── data/                           <- Data directory (tracked files only; large files ignored)
+├── data/                           <- Data directory (data is uploaded in an independent repository at Zenodo)
 │
-├── models/                         <- External model configurations
+├── models/                         <- External model configurations (models are uploaded in an independent repository at Zenodo)
 │
-├── outputs/                        <- Generated results (tracked as examples)
-│   ├── figures/                    <- Damage maps, convergence charts, SHAP plots
-│   ├── hecras/                     <- Results from hecras models (deterministic or stochastic)
-│   └── tables/                     <- Extracted CSVs and summary data
-│
-├── tests/                          <- Isolated test suite 
-│   ├── test_data/                  <- Mock datasets for verification
-│   ├── test_models/                <- Mock models for verification
-│   └── test_outputs/               <- Mock outputs for verification
-│
-└── docs/                           <- Documentation and manuscript drafts
-    ├── Draft.docx
-    ├── Supplementary_Data.docx
-    └── llm/                        <- A txt copy of each script to allow parsing them as context for the AI use
+└── tests/                          <- Isolated test suite 
+    ├── test_data/                  <- Mock datasets for verification
+    ├── test_models/                <- Mock models for verification
+    └── test_outputs/               <- Mock outputs for verification
 ```
 
 ### Notes:
-1. This repository and python code is not a python library neither a fully automatic pip-line, rather it is a worspace to use dynamicly on a code editor such as Visual Studio Code together with Conda environment. All workflow can be done trough main.py
+1. This repository and python code is not a python library neither a fully automatic pip-line, rather it is a worspace to use dynamicly on a code editor such as Visual Studio Code together with Conda environment. All workflow is indicated in main.py
 
 2. Large files used in the process (`data/` and `models/`) are ommited on this repository. They can be found as part of the research on Zenodo.
 

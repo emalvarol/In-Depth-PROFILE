@@ -196,8 +196,14 @@ class SurrogateSensitivityEngine:
                 
                 if not os.path.exists(model_path):
                     xgb_model = xgb.XGBRegressor(
-                        **xgb_params, random_state=42, device='cuda', eval_metric='rmse',
-                        tree_method='hist', booster='gbtree', objective='reg:squarederror', enable_categorical=True
+                        **xgb_params,
+                        random_state=42,
+                        device='cuda',
+                        eval_metric='rmse',
+                        tree_method='hist',
+                        booster='gbtree',
+                        objective='reg:squarederror',
+                        enable_categorical=True
                     )
                     xgb_model.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_test, y_test)], verbose=False)
                     xgb_model.save_model(model_path)
@@ -241,7 +247,9 @@ class SurrogateSensitivityEngine:
                 xgb_params[int_param] = int(xgb_params[int_param])
                 
             xgb_model = xgb.XGBRegressor(
-                **xgb_params, random_state=42, device='cuda', eval_metric='rmse',
+                **xgb_params,
+                random_state=42,
+                device='cuda', eval_metric='rmse',
                 tree_method='hist', booster='gbtree', objective='reg:squarederror', enable_categorical=True
             )
             print(f"[MODEL FIT] Executing complete spatial matrix fit for RP {rp} over CUDA channels...")

@@ -1,1267 +1,3185 @@
-"""
-In-Depth-PROFILE Plotting and Results Visualization Module
-This module encapsulates all helper analytical parsing functions, data preparation
-routines, and vectorized visualization components to render figures, maps, and tables
-for flood loss estimation and global sensitivity analyses.
-"""
-
 import os
-import glob
-import re
-import math
 from pathlib import Path
-from functools import partial
-import numpy as np
+from io import BytesIO
+import mocaloss as mcl
+from mocaloss import PostProcessor
+from mocaloss import CLTUnivariateStrategy, CLTMultivariateStrategy
 import pandas as pd
 import geopandas as gpd
-from shapely.geometry import Polygon
+import polars as pl
+import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-import matplotlib.patheffects as pe
-import matplotlib.patches as patches
-import matplotlib.lines as lines
+import matplotlib.cm as cm
 import matplotlib.ticker as ticker
-from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-from tqdm import tqdm
+import matplotlib.colors as mcolors
+import matplotlib.image as mpimg
+from matplotlib.ticker import FuncFormatter
+from matplotlib_scalebar.scalebar import ScaleBar
+from owslib.wms import WebMapService
+from scipy.stats import gaussian_kde
+from scipy.stats import pearson3
+import rasterio
+from rasterio import features
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+from rasterio.transform import from_bounds
+from shapely.geometry import Polygon
+from shapely.geometry import box
+from shapely.geometry import shape
 
-class shap_results_grouper:
-    def __init__(self, columns, separator="|"):
-        self.separator = separator
-        self.columns_state = [str(col).split(self.separator) for col in columns]
+def run_all_plots():
+    # ------------------------------
+    ## 1. SET-UP
+    # ------------------------------
+    # --- INITIALIZATION ---
+    results = PostProcessor(working_dir=r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss")
+    results.load(chunk_dirs = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\.cache\mocaloss_results")
 
-    def print_unique_names(self, level_index):
-        unique_groups = set()
-        for col_levels in self.columns_state:
-            if level_index < len(col_levels):
-                unique_groups.add(col_levels[level_index])
-        print(f"{len(unique_groups)} groups found")
-        print(f"Unique groups at Level {level_index}:", sorted(list(unique_groups)))
+    # --- SUMARY ---
+    all_cols = results.print_columns()
+    def print_complete_summary(all_cols, results):
+        summary_data = []
 
-    def remove_all_levels(self):
-        for i, col_levels in enumerate(self.columns_state):
-            self.columns_state[i] = [col_levels[0]]
-
-    def add_level(self, rules, default="Unclassified"):
-        for i, col_levels in enumerate(self.columns_state):
-            base_name = col_levels[0]
-            new_group = default
+        for col in all_cols:
+            print(f"[print_complete_summary] Preparing column: {col}")
+            # 1. Iteratively load each column one-by-one
+            df_col = results.collect_data(columns=[col])
+            s = df_col[col]
             
-            if callable(rules):
-                new_group = rules(base_name)
-            elif isinstance(rules, dict):
-                for pattern, group_name in rules.items():
-                    if pattern == base_name or (isinstance(pattern, str) and re.search(pattern, base_name)):
-                        new_group = group_name
-                        break
-                        
-            self.columns_state[i].append(new_group)
-
-    def update_dataframe(self, df):
-        df.columns = [self.separator.join(col_levels) for col_levels in self.columns_state]
-        return df
-
-class DataPreparator:
-    """
-    Handles data aggregation, mathematical convergence checking, and formatting 
-    for plotting matrices and output tables.
-    """
-    def __init__(self, config_paths, config_codes, config_return_periods):
-        self.paths = config_paths
-        self.codes = config_codes
-        self.return_periods = config_return_periods
-
-    @staticmethod
-    def load_mc_part(part_path):
-        return pd.read_parquet(part_path)
-    
-    @staticmethod
-    def load_and_concatenate_mc_parts(results_dir, target_cols, base_file_name, bids_to_exclude=None):
-        """
-        Loads specific columns from parquet files to minimize memory footprint.
-        Only SN, BID, RP, and columns starting with 'c_' are retained.
-        """
-        if bids_to_exclude is None:
-            bids_to_exclude = []
+            total_len = len(s)
+            pct_null = (s.null_count() / total_len) * 100 if total_len > 0 else 0.0
             
-        file_list = sorted(glob.glob(os.path.join(results_dir, f"{base_file_name}_*.parquet")))
-        
-        if not file_list:
-            return pd.DataFrame()
-
-        parts = []
-        exclude_set = set(bids_to_exclude)
-        
-        for file in tqdm(file_list, desc="Merging MC Parts"):
-            temp_df = pd.read_parquet(file, columns=target_cols)
-            if exclude_set:
-                temp_df = temp_df[~temp_df['BID'].isin(exclude_set)]
-            parts.append(temp_df)
+            # Check if the column is numeric to avoid errors on strings (like Building Type 'BT')
+            is_numeric = s.dtype in [
+                pl.Float64, pl.Float32, pl.Int64, pl.Int32, 
+                pl.Int16, pl.Int8, pl.UInt64, pl.UInt32, pl.UInt16, pl.UInt8
+            ]
             
-        df = pd.concat(parts, ignore_index=True)
-        
-        del temp_df
-        del parts
-        
-        return df
-    
-    @staticmethod
-    def load_flooded_buildings_gdf(building_path, depth_samples_path):
-        gdf_buildings = gpd.read_file(building_path)
-        df_depth_samples = pd.read_pickle(depth_samples_path)
-        BIDs_flooded = df_depth_samples.groupby('BID')['he'].transform('max') > 0
-        df_depth_samples = df_depth_samples[BIDs_flooded].reset_index(drop=True)
-        BIDs_flooded_unq = df_depth_samples['BID'].unique()
-        gdf_buildings = gdf_buildings[gdf_buildings['BID'].isin(BIDs_flooded_unq)].copy()
-        return gdf_buildings
-    
-    @staticmethod
-    def calc_hr_convergence(self, df, rp_key, threshold=0.1, z_score=1.96):
-        """
-        Calculates convergence metrics for a specific Return Period.
-        Criteria: SN > 30, IRME == 0, and 30 consecutive stable steps.
-        """
-        rp_df = df[df['RP'] == rp_key].copy()
-        
-        if rp_df.empty:
-            return False, rp_df
-
-        rp_df = rp_df.sort_values(by=['BID', 'SN'])
-
-        rp_df['he_BID_sn'] = rp_df.groupby('BID')['he'].transform(lambda x: x.expanding().mean())
-        rp_df['SD_BID_sn'] = rp_df.groupby('BID')['he'].transform(lambda x: x.expanding().std(ddof=1))
-        rp_df['SE_BID_sn'] = rp_df['SD_BID_sn'] / np.sqrt(rp_df['SN'])
-        rp_df['ME_BID_sn'] = z_score * rp_df['SE_BID_sn']
-        rp_df['Residual'] = (rp_df['ME_BID_sn'] - threshold).clip(lower=0)
-        
-        rp_df['MET_BID'] = (rp_df['SN'] > 30) & (rp_df['Residual'] == 0)
-        
-        blocks = (~rp_df['MET_BID']).groupby(rp_df['BID']).cumsum()
-        rp_df['STC_BID'] = rp_df.groupby(['BID', blocks]).cumcount() * rp_df['MET_BID']
-        rp_df['CONV_BID'] = rp_df['STC_BID'] >= 30
-        
-        rp_simp = rp_df.groupby('SN').agg(
-            IRME=('Residual', 'sum'),
-            NON_CONV_COUNT=('Residual', lambda x: (x > 0).sum())
-        ).reset_index()
-
-        total_flooded_bids = rp_df[rp_df['he'] > 0]['BID'].nunique()
-        if total_flooded_bids > 0:
-            rp_simp['REL_NON_CONV'] = (rp_simp['NON_CONV_COUNT'] / total_flooded_bids) * 100
-        else:
-            rp_simp['REL_NON_CONV'] = 0.0
-
-        rp_simp['MET'] = (rp_simp['SN'] > 30) & (rp_simp['IRME'] == 0)
-
-        blocks = (~rp_simp['MET']).cumsum()
-        rp_simp['STC_AG'] = rp_simp.groupby(blocks).cumcount() * rp_simp['MET']
-        rp_simp['CONV'] = rp_simp['STC_AG'] >= 30
-
-        if not rp_simp.empty:
-            is_converged = rp_simp['CONV'].iloc[-1]
-            return bool(is_converged), rp_simp, rp_df
-        
-        return False, rp_simp
-
-    @staticmethod
-    def calc_vats_convergence(self, df, n_sims, n_start=500, calc_step=500, n_step_check=3, 
-                              alphas=[50, 10, 5, 1], epsilons=[25, 20, 10, 5, 1], cores=4):
-        """
-        Extended Vats et al. (2019) multivariate stopping rule for multiple buildings.
-        """
-        import multiprocess
-        
-        RPs_vats = np.sort(df['RP'].unique())
-        cost_cols = [c for c in df.columns if c.startswith('c_')]
-        expected_sns_full = np.arange(1, n_sims + 1)
-        
-        final_results = []
-        detailed_results = []
-        execution_logs = []
-        
-        process_func = partial(_process_bid_worker, alphas=alphas, epsilons=epsilons)
-        
-        for rp in RPs_vats:
-            df_rp = df[df["RP"] == rp]
-            BIDs_vats_rp = np.sort(df_rp['BID'].unique())
-            total_rp_bids = len(BIDs_vats_rp)
-            consecutive_convergence = {bid: 0 for bid in BIDs_vats_rp}
-            active_bids = set(BIDs_vats_rp)
-            
-            grouped = df_rp.groupby("BID")
-            bid_matrices = {
-                bid: (
-                    group.set_index("SN")
-                    .reindex(expected_sns_full, fill_value=0.0)[cost_cols]
-                    .values.astype(np.float64)
-                )
-                for bid, group in grouped if bid in BIDs_vats_rp
-            }
-            
-            with multiprocess.Pool(processes=cores) as pool:
-                steps = list(range(n_start, n_sims + 1, calc_step))
-                if not steps or steps[-1] < n_sims: 
-                    steps.append(n_sims)
-                    
-                for n in steps:
-                    if not active_bids:
-                        break
-                    
-                    args_list = [(bid_matrices[bid][:n], bid, n) for bid in active_bids]
-                    outputs = pool.map(process_func, args_list)
-
-                    step_metrics = {}
-                    new_active_bids = []
-                    
-                    for out in outputs:
-                        if out["logs"]:
-                            execution_logs.extend(out["logs"])
-                            
-                        if out["status"] in ("skipped", "error"):
-                            new_active_bids.append(out["bid"])
-                            continue
-
-                        detailed_row = {
-                            "RP": rp, "SN": n, "BID": out["bid"], "status": out["status"]
-                        }
-                        detailed_row.update(out["residuals"])
-                        detailed_row.update(out["active_counts"])
-                        detailed_results.append(detailed_row)
-                        
-                        for k, v in out["residuals"].items():
-                            step_metrics[k] = step_metrics.get(k, 0.0) + v
-                        for k, v in out["active_counts"].items():
-                            step_metrics[k] = step_metrics.get(k, 0) + v
-                        
-                        if out["status"] == "converged":
-                            consecutive_convergence[out["bid"]] += 1
-                        else:
-                            consecutive_convergence[out["bid"]] = 0
-                            
-                        if consecutive_convergence[out["bid"]] < n_step_check:
-                            new_active_bids.append(out["bid"])
-
-                    row = {
-                        "RP": rp, "SN": n, "total_rp_bids": total_rp_bids,
-                        "any_active_bids": len(new_active_bids) 
-                    }
-                    row.update(step_metrics)
-                    final_results.append(row)
-                    active_bids = set(new_active_bids)
-                    
-        return pd.DataFrame(final_results), pd.DataFrame(detailed_results), execution_logs
-    
-    @staticmethod
-    def calc_result_expected(df, target_col='c_bf', min_rp_AEP_0=None):
-        import numpy as np
-        import pandas as pd
-        
-        df_q50 = df.groupby(['BID', 'RP'])[target_col].median().reset_index()
-        df_q50.rename(columns={target_col: 'Q50'}, inplace=True)
-        
-        if min_rp_AEP_0 is not None:
-            unique_bids = df_q50[['BID']].drop_duplicates()
-            unique_bids['RP'] = float(min_rp_AEP_0)
-            unique_bids['Q50'] = 0.0
-            df_q50 = pd.concat([df_q50, unique_bids], ignore_index=True)
-            
-        df_q50['AEP'] = 1.0 / df_q50['RP']
-        
-        df_pivot = df_q50.pivot(index='BID', columns='AEP', values='Q50').fillna(0.0)
-        df_pivot = df_pivot.sort_index(axis=1)
-        
-        aep_axes = df_pivot.columns.values
-        expected_values = np.trapezoid(df_pivot.values, x=aep_axes, axis=1)
-        
-        df_expected = pd.DataFrame({
-            f'Expected_{target_col}': expected_values
-        }, index=df_pivot.index).reset_index()
-        
-        return df_expected
-    
-    @staticmethod
-    def calc_shap_expected_grouped(output_gsa_dir, RPs_unq, level=0, by_bid=False, min_rp_AEP_0=None):
-        """
-        Aggregates SHAP values by a specified multi-index level,
-        calculates absolute quantiles per return period, and integrates over the AEP curve
-        to return Expected Annual SHAP values.
-        """
-        import os
-        import gc
-        import numpy as np
-        import pandas as pd
-
-        bid_name = 'bid' if by_bid else 'all'
-        level_name = f"l{level}"
-        file_name = f"df_expected_{level_name}_{bid_name}.feather"
-        
-        # Uses class instance path instead of function argument
-        output_path = os.path.join(output_gsa_dir, file_name)
-        
-        groupby_cols = ['Feature_Group', 'BID'] if by_bid else ['Feature_Group']
-        
-        if os.path.exists(output_path):
-            print(f"\n[INFO] Expected Annual SHAP file already exists. Loading from: {output_path}")
-            df_expected = pd.read_feather(output_path)
-            return df_expected.set_index(groupby_cols)
-            
-        print(f"\n[INFO] Target file {file_name} not found. Running calculations workflow pipeline...")
-        
-        target_idx = int(level)
-        all_rp_quantiles = []
-        
-        # 1. Process each Return Period
-        for rp in RPs_unq:
-            print(f"Processing rp {rp}")
-            shap_path = os.path.join(output_gsa_dir, f"shap_results_rp_{rp}.feather")
-            if not os.path.exists(shap_path):
-                print(f"SHAP file for RP {rp} not found at {shap_path}. Skipping.")
-                continue
-            
-            print(f"Loading file...")
-            df_shap = pd.read_feather(shap_path)
-            
-            meta_cols = [c for c in df_shap.columns if 'BID' in c or 'base_value' in c]
-            feature_cols = [c for c in df_shap.columns if c not in meta_cols]
-            
-            col_mapping = [str(c).split('|')[target_idx] for c in feature_cols]
-            
-            print(f"Preparing data...")
-            grouped_features = (
-                df_shap[feature_cols]
-                .T.groupby(by=col_mapping)
-                .sum()
-                .T
-            )
-            
-            print(f"Calculating quantiles...")
-            if by_bid:
-                bid_col = next(c for c in meta_cols if 'BID' in c)
-                grouped_features['BID'] = df_shap[bid_col]
-                
-                quantiles = grouped_features.set_index('BID').abs().groupby('BID').quantile([0.05, 0.50, 0.95])
-                quantiles.index.names = ['BID', 'Quantile']
-                
-                quantiles = quantiles.T.stack(level='BID', future_stack=True)
-                quantiles.columns = ['Q05', 'Q50', 'Q95']
-                quantiles.index.names = ['Feature_Group', 'BID']
+            if is_numeric:
+                min_val = s.min()
+                max_val = s.max()
+                q05 = s.quantile(0.05)
+                q50 = s.quantile(0.50)
+                q95 = s.quantile(0.95)
+                pct_zero = ((s == 0).sum() / total_len) * 100 if total_len > 0 else 0.0
             else:
-                quantiles = grouped_features.abs().quantile([0.05, 0.50, 0.95]).T
-                quantiles.columns = ['Q05', 'Q50', 'Q95']
-                quantiles.index.name = 'Feature_Group'
-                
-            quantiles['RP'] = rp
-            all_rp_quantiles.append(quantiles)
-            
-            del df_shap, grouped_features, quantiles
-            gc.collect()
+                min_val = None
+                max_val = None
+                q05 = None
+                q50 = None
+                q95 = None
+                pct_zero = None
 
-        if not all_rp_quantiles:
-            return pd.DataFrame()
-
-        df_all = pd.concat(all_rp_quantiles).reset_index()
-        
-        # 2. Add zero boundary anchor point
-        if min_rp_AEP_0 is not None:
-            unique_groups = df_all[groupby_cols].drop_duplicates()
-            unique_groups['Q05'] = 0.0
-            unique_groups['Q50'] = 0.0
-            unique_groups['Q95'] = 0.0
-            unique_groups['RP'] = float(min_rp_AEP_0)
-            df_all = pd.concat([df_all, unique_groups], ignore_index=True)
+            # 2. Print metrics for the column
+            print(f"--- {col} ---")
+            print(f"Min: {min_val} | Max: {max_val}")
+            print(f"Q05: {q05} | Q50 (Median): {q50} | Q95: {q95}")
+            zero_str = f"{pct_zero:.2f}%" if pct_zero is not None else "N/A (Non-numeric)"
+            print(f"% Zeros: {zero_str} | % Nulls: {pct_null:.2f}%\n")
             
-        df_all['AEP'] = 1.0 / df_all['RP']
-        
-        print(f"Calculating expected value among all rp")
-        # 3. Vectorized Matrix Trapezoidal Integration (Replaces slow .apply bottleneck)
-        df_pivot = df_all.pivot(index=groupby_cols, columns='AEP', values=['Q05', 'Q50', 'Q95'])
-        
-        # Fill missing RP gaps with 0.0 to allow integration for BIDs that only appear in high RPs
-        df_pivot = df_pivot.fillna(0.0)
-        
-        df_pivot = df_pivot.sort_index(axis=1, level='AEP')
-        
-        aep_axes = df_pivot.columns.get_level_values('AEP').unique().values
-        
-        q05_expected = np.trapezoid(df_pivot['Q05'].values, x=aep_axes, axis=1)
-        q50_expected = np.trapezoid(df_pivot['Q50'].values, x=aep_axes, axis=1)
-        q95_expected = np.trapezoid(df_pivot['Q95'].values, x=aep_axes, axis=1)
-        
-        df_expected = pd.DataFrame({
-            'Q05': q05_expected,
-            'Q50': q50_expected,
-            'Q95': q95_expected
-        }, index=df_pivot.index).reset_index()
-        
-        # 4. Vectorized Share Percentages
-        print(f"Calculating share percentages")
-        quantile_cols = ['Q05', 'Q50', 'Q95']
-        if by_bid:
-            for col in quantile_cols:
-                total_sum = df_expected.groupby('BID')[col].transform('sum')
-                df_expected[f'{col}_share_%'] = np.where(total_sum != 0, (df_expected[col] / total_sum) * 100, 0.0)
-        else:
-            for col in quantile_cols:
-                total_sum = df_expected[col].sum()
-                df_expected[f'{col}_share_%'] = (df_expected[col] / total_sum) * 100 if total_sum != 0 else 0.0
+            summary_data.append({
+                "column": col,
+                "min": min_val,
+                "max": max_val,
+                "q05": q05,
+                "q50": q50,
+                "q95": q95,
+                "pct_zero": pct_zero,
+                "pct_null": pct_null
+            })
 
-        df_expected = df_expected.sort_values(by='Q50', ascending=False).set_index(groupby_cols)
+        # 3. Create and print the final Polars DataFrame showing all columns and rows
+        summary_df = pl.DataFrame(summary_data)
         
-        df_expected.reset_index().to_feather(output_path)
-        print(f"[SUCCESS] Calculated results written down successfully into destination path: {output_path}")
-        return df_expected
-    
-    @staticmethod
-    def calc_shap_rp_evolution_grouped(output_gsa_dir, rps_list, level=0, by_bid=False):
-        """Extracts and formats intermediate variance trends across distinct return period horizons."""
-        bid_name = 'bid' if by_bid else 'all'
-        output_path = os.path.join(output_gsa_dir, f"df_evolution_l{level}_{bid_name}.feather")
-        groupby_cols = ['Feature_Group', 'BID'] if by_bid else ['Feature_Group']
+        print("=== FINAL SUMMARY DATAFRAME ===")
+        with pl.Config(tbl_rows=len(all_cols), fmt_str_lengths=50):
+            print(summary_df)
         
-        if os.path.exists(output_path):
-            return pd.read_feather(output_path).set_index(groupby_cols)
-            
-        all_rp_data = []
-        for rp in rps_list:
-            shap_path = os.path.join(output_gsa_dir, f"shap_results_rp_{rp}.feather")
-            if not os.path.exists(shap_path): continue
-            
-            df_shap = pd.read_feather(shap_path)
-            meta_cols = [c for c in df_shap.columns if 'BID' in c or 'base_value' in c]
-            feature_cols = [c for c in df_shap.columns if c not in meta_cols]
-            col_mapping = [str(c).split('|')[int(level)] for c in feature_cols]
-            
-            grouped_features = df_shap[feature_cols].T.groupby(by=col_mapping).sum().T
-            if by_bid:
-                bid_col = next(c for c in meta_cols if 'BID' in c)
-                grouped_features['BID'] = df_shap[bid_col]
-                q50 = grouped_features.set_index('BID').abs().groupby('BID').quantile(0.50).stack(future_stack=True).reset_index()
-                q50.columns = ['BID', 'Feature_Group', 'Q50']
-                total = q50.groupby('BID')['Q50'].transform('sum')
-                q50['Share_%'] = np.where(total != 0, (q50['Q50'] / total) * 100, 0.0)
-            else:
-                q50 = grouped_features.abs().quantile(0.50).reset_index()
-                q50.columns = ['Feature_Group', 'Q50']
-                total = q50['Q50'].sum()
-                q50['Share_%'] = (q50['Q50'] / total) * 100 if total != 0 else 0.0
-                
-            q50['RP'] = rp
-            all_rp_data.append(q50)
-            
-        if not all_rp_data: return pd.DataFrame()
-        df_pivot = pd.concat(all_rp_data, ignore_index=True).pivot(index=groupby_cols, columns='RP', values=['Q50', 'Share_%']).fillna(0.0)
-        df_pivot.columns = [f"{m}_RP{rp}" for m, rp in df_pivot.columns]
-        df_evolution = df_pivot.sort_index()
-        df_evolution.reset_index().to_feather(output_path)
-        return df_evolution
+        return summary_data
+    # summary_data = print_complete_summary(all_cols, results)
 
-    @staticmethod
-    def generate_scaled_multilayer_sankey(df_list, relations_list, CODES, colors_dict=None, scale_params=None):
-        """Constructs unified structural flow charts linking structural subsets together securely."""
-        if len(df_list) - 1 != len(relations_list):
-            raise ValueError("relations_list length must equal len(df_list) - 1.")
-            
-        nodes = []
-        links = []
-        node_counter = 0
-        num_layers = len(df_list)
-        x_coords = np.linspace(0.1, 0.9, num_layers)
-        
-        global_max_vol = max(df['Q50_share_%'].sum() for df in df_list)
-        
-        if scale_params:
-            raw_split = global_max_vol * scale_params['data_pct']
-            v_pct = scale_params['canvas_pct']
-            fwd = lambda x: np.where(
-                x <= raw_split, 
-                (v_pct / raw_split) * x, 
-                v_pct + ((1.0 - v_pct) / (global_max_vol - raw_split)) * (x - raw_split)
-            )
-        else:
-            fwd = lambda x: x / global_max_vol
 
-        layer_node_tracking = []
-        
-        # --- PHASE 1: GENERATE NODES ---                
-        for i in range(num_layers):
-            df_clean = df_list[i].dropna(subset=['Q50_share_%']).copy()
-            sorted_features = df_clean.sort_values(by='Q50_share_%', ascending=True).index.tolist()
-            layer_map = {}
-            cum_vol = 0.0
-                
-            for feat in sorted_features:
-                val = df_clean.loc[feat, 'Q50_share_%']
-                v0 = float(fwd(cum_vol))
-                v1 = float(fwd(cum_vol + val))
-                clean_name = str(feat).split(' (')[0].split('_')[0]
-                                
-                if clean_name in colors_dict:
-                    node_color = colors_dict[clean_name]
-                elif clean_name in CODES.get("Content", []):
-                    node_color = colors_dict.get("Content", "#cccccc")
-                elif clean_name in CODES.get("Continent", []):
-                    node_color = colors_dict.get("Continent", "#cccccc")
-                else:
-                    node_color = "#cccccc"
-                        
-                nodes.append({
-                    "name": f"{feat} (L{i+1})", 
-                    "x": x_coords[i], 
-                    "y": v0, 
-                    "h": v1 - v0, 
-                    "color": node_color,
-                    "edgecolor": 'white',
-                    "linewidth": 0.5,
-                })
-                
-                layer_map[feat] = {
-                    'id': node_counter, 
-                    'val': val, 
-                    'out_curr_raw': cum_vol, 
-                    'in_curr_raw': cum_vol
-                }
-                node_counter += 1
-                cum_vol += val
-                
-            layer_node_tracking.append(layer_map)
-
-        # --- PHASE 2: ROUTE LINKS ---
-        for i in range(num_layers - 1):
-            left_map = layer_node_tracking[i]
-            right_map = layer_node_tracking[i+1]
-            relations = relations_list[i]
-            
-            split_srcs = set(relations.keys())
-            split_tgts = set([t for ts in relations.values() for t in ts])
-            
-            rev_rels = {}
-            for s, ts in relations.items():
-                for t in ts: 
-                    rev_rels.setdefault(t, []).append(s)
-                
-            # 1. Explicit Relations (Splits 1-to-N and Merges N-to-1)
-            for src_feat, target_list in relations.items():
-                if src_feat not in left_map: continue
-                s_info = left_map[src_feat]
-                t_total = sum([right_map[t]['val'] for t in target_list if t in right_map])
-                
-                for tgt_feat in target_list:
-                    if tgt_feat not in right_map: continue
-                    t_info = right_map[tgt_feat]
-                    src_total = sum([left_map[s]['val'] for s in rev_rels[tgt_feat] if s in left_map])
-                    
-                    s_link = s_info['val'] * (t_info['val'] / t_total if t_total > 0 else 0)
-                    t_link = t_info['val'] * (s_info['val'] / src_total if src_total > 0 else 0)
-                    
-                    s0 = float(fwd(s_info['out_curr_raw']))
-                    s1 = float(fwd(s_info['out_curr_raw'] + s_link))
-                    t0 = float(fwd(t_info['in_curr_raw']))
-                    t1 = float(fwd(t_info['in_curr_raw'] + t_link))
-                    
-                    links.append({
-                        "source": s_info['id'], 
-                        "target": t_info['id'], 
-                        "value_src": s1 - s0, 
-                        "value_tgt": t1 - t0, 
-                        "src_y": s0, 
-                        "tgt_y": t0, 
-                        "color": nodes[s_info['id']]['color']
-                    })
-                    s_info['out_curr_raw'] += s_link
-                    t_info['in_curr_raw'] += t_link
-
-            # 2. Standard 1-to-1 Connections
-            for feat in left_map.keys():
-                if feat in split_srcs or feat not in right_map or feat in split_tgts: continue
-                
-                s_info = left_map[feat]
-                t_info = right_map[feat]
-                
-                s0 = float(fwd(s_info['out_curr_raw']))
-                s1 = float(fwd(s_info['out_curr_raw'] + s_info['val']))
-                t0 = float(fwd(t_info['in_curr_raw']))
-                t1 = float(fwd(t_info['in_curr_raw'] + t_info['val']))
-                
-                links.append({
-                    "source": s_info['id'], 
-                    "target": t_info['id'], 
-                    "value_src": s1 - s0, 
-                    "value_tgt": t1 - t0, 
-                    "src_y": s0, 
-                    "tgt_y": t0, 
-                    "color": nodes[s_info['id']]['color']
-                })
-                s_info['out_curr_raw'] += s_info['val']
-                t_info['in_curr_raw'] += t_info['val']
-                
-        return nodes, links
-
-    @staticmethod
-    def simplify_flood_contour(self, shp):
-        """Dissolves interiors and eliminates micro-scale polygon slivers from inundation layer sheets."""
-        shp = shp.explode(index_parts=False)
-        shp.geometry = shp.geometry.apply(lambda poly: Polygon(poly.exterior) if poly.interiors else poly)
-        shp = shp[shp.geometry.area > 1e-7]
-        union_geom = shp.union_all()
-        simplified = union_geom.simplify(tolerance=0.0001, preserve_topology=True)
-        return gpd.GeoDataFrame(geometry=[simplified], crs="EPSG:4326")
-
-class Plotter:
-    """
-    Handles Matplotlib rendering, axes scales, styling configurations, 
-    and the centralized vectorized plot_any engine.
-    """
-    def __init__(self, config_paths, config_codes, config_return_periods):
-        """Initializes the visualizer with framework metadata and single-source truth catalogs."""
-        self.paths = config_paths
-        self.codes = config_codes
-        self.return_periods = config_return_periods
-        
-        # Single Source of Truth Style Configuration
-        self.global_pre_style = {
-            'font.family': 'serif',
-            'font.serif': ['Times New Roman'],
-            'mathtext.fontset': 'cm',
-            'axes.unicode_minus': False,
-            'font.size': 8,
-            'axes.labelsize': 8,
-            'xtick.labelsize': 8,
-            'ytick.labelsize': 8,
-            'legend.fontsize': 8,
-            'figure.titlesize': 8,
-            'axes.grid': True,
-            'grid.alpha': 0.3,
-            'grid.linestyle': '--',
-            'legend.frameon': False,
-            'axes.spines.top': False,
-            'axes.spines.right': False,
+    # --- GENERAL ---
+    DET_IF = {
+        10:     461.8,
+        50:     817.6,
+        100:    991.5,
+        500:    1441.5,
+    }
+    DET_SHP =  {
+        10:     r"C:\Users\outal\GITHUB\InDepthPROFILE\data\inputs\gis\OficialFloods\Q10_2Ciclo_PB_2026_Navaluenga.shp",
+        50:     r"C:\Users\outal\GITHUB\InDepthPROFILE\data\inputs\gis\OficialFloods\Q50_2Ciclo_PB_2026_Navaluenga.shp",
+        100:    r"C:\Users\outal\GITHUB\InDepthPROFILE\data\inputs\gis\OficialFloods\Q100_2Ciclo_PB_2026_Navaluenga.shp",
+        500:    r"C:\Users\outal\GITHUB\InDepthPROFILE\data\inputs\gis\OficialFloods\Q500_2Ciclo_PB_2026_Navaluenga.shp",
+    }
+    RETURN_PERIODS = {
+        #2:    [115,   159,    219], # Excluded from the analysis, any damage generated.
+        5:    [279,   399,    570],
+        10:   [442,   644,    980],
+        25:   [652,   1075,   1796],
+        50:   [850,   1493,   2663],
+        100:  [1082,  2007,   3800],
+        200:  [1347,  2638,   5275],
+        500:  [1751,  3671,   7908],
+    }
+    sto_base = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\intermediate\gis\ModeledFloods"
+    gsa_dir = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\postprocessor\gsa"
+    STO_TIF = {
+        10: {
+            "Q05": sto_base + "/WSE_RP10_SN23_Q05.tif",
+            "Q50": sto_base + "/WSE_RP10_SN79_Q50.tif",
+            "Q95": sto_base + "/WSE_RP10_SN68_Q95.tif",
+        },
+        50: {
+            "Q05": sto_base + "/WSE_RP50_SN542_Q05.tif",
+            "Q50": sto_base + "/WSE_RP50_SN26_Q50.tif",
+            "Q95": sto_base + "/WSE_RP50_SN343_Q95.tif",
+        },
+        100: {
+            "Q05": sto_base + "/WSE_RP100_SN277_Q05.tif",
+            "Q50": sto_base + "/WSE_RP100_SN503_Q50.tif",
+            "Q95": sto_base + "/WSE_RP100_SN193_Q95.tif",
+        },
+        500: {
+            "Q05": sto_base + "/WSE_RP500_SN213_Q05.tif",
+            "Q50": sto_base + "/RP500_Q50.tif",
+            "Q95": sto_base + "/WSE_RP500_SN242_Q95.tif",
         }
-        
-        # Return Period Mapping
-        rps = list(config_return_periods.keys())
-        cmap_rp = plt.get_cmap('viridis', len(rps))
-        self.rp_colors = {rp: cmap_rp(i) for i, rp in enumerate(rps)}
-        self.rp_indices = range(len(rps))
-        
-        # Floodplain Contours Mapping
-        self.q_colors = {
-            'sto_Q05_contour': "#0084FF",
-            'sto_Q50_contour': "#2F00FF",
-            'det_Q50_contour': "#16B302",
-            'sto_Q95_contour': "#6F00FF",
+    }
+    color_dic = {
+        "RP": {
+            5:   "#440154",  # viridis: deep purple
+            10:  "#443983",  # purple-blue
+            25:  "#31688e",  # blue
+            50:  "#21918c",  # teal
+            100: "#35b779",  # green
+            200: "#90d743",  # lime
+            500: "#fde725",  # yellow
+        },
+        "shap_groups": {
+            "he":                 "#E60000",  # Saturated Red
+            "ed":                 "#FF6600",  # Vivid Orange
+            "Cga":                "#FFD700",  # Bright Gold / Yellow
+            "HU":                 "#00E676",  # Bright Spring Green
+            "building_elevation": "#00E5FF",  # Electric Cyan
+            "price_CTE":          "#0066FF",  # Saturated Royal Blue
+            "price_CTI":          "#6600FF",  # Vivid Electric Violet
+            "material":           "#FF00FF",  # Saturated Magenta / Fuchsia
+            "count_CTE":          "#FF007F",  # Vivid Deep Pink
+            "count_CTI":          "#990000",  # Dark Crimson
+            "ch_CTE":             "#008080",  # Deep Teal
+            "ch_CTI":             "#8B00FF",  # Electric Indigo
         }
-        
-        # Sensitivity Analysis Core Mapping Tracker
-        self.gsa_group_colors = {
-            'he': "#ff0000",
-            'Structure': "#ff7300",
-            'GL': "#ca5b01ff",
-            'BH': "#a86936",
-            'IH': "#632d01",
-            'Cga': "#fc913a",
-            'C.High': "#00ff0d",
-            'Prices': "#00f7ff",
-            'Objects': "#4c00ff",
-            'ed': "#ae00ff",
-            'Materials': "#ff0095",
-            'Content': "#9293ce",
-            'Continent': "#c992ce",
-        }
-        
-        # Maps
-        self.dst_crs = 'EPSG:4326'
-        self.gdf_buildings = gpd.read_file(config_paths['buildings_shp'])
-        
-    def plot_any(self, layout_params, dict_to_plot, save_params, global_pre_style=None, global_style=None):
-        """
-        Populates multi-panel mosaic or standard grid structures dynamically via configured dictionaries.
-        Recovers the modular structure and comprehensive plot/style/legend options from the original implementation.
-        """
-        import os
-        import numpy as np
-        import matplotlib.pyplot as plt
-        
-        # 0. Helper for parameter filtering
-        def get_kwargs(data_dict, exclude_keys):
-            internal_keys = {'plot_type', 'style_type', 'legend_type', 'gstype'}
-            to_exclude = set(exclude_keys) | internal_keys
-            return {k: v for k, v in data_dict.items() if k not in to_exclude}
-        
-        def _check_required_keys(params, required, ptype, ax_key):
-            if not all(k in params for k in required):
-                raise KeyError(f"Axis '{ax_key}': '{ptype}' requires {required} keys.")
-        
-        # 1. Global pre-Style
-        def set_global_pre_style(style_config):
-            defaults = self.global_pre_style.copy()
-            if style_config:
-                defaults.update(style_config)
-            plt.rcParams.update(defaults)
-        print(f"\n[Plotter.plot_any] Setting global pre style...")
-        set_global_pre_style(global_pre_style)
-
-        # 2. Set Layout
-        def set_layout(params):
-            layout = params.get('layout', '1x1')
-            figsize = params.get('figsize', (4, 4))
-            mosaic = params.get('mosaic_structure')
-            squared = params.get('squared', False)
-            kwargs = params.get('kwargs', {})
-
-            if layout == "mosaic":
-                if mosaic is None:
-                    raise ValueError("mosaic_structure required for mosaic layout.")
-                fig, ax_dict = plt.subplot_mosaic(mosaic, figsize=figsize, **kwargs)
-            else:
-                rows, cols = map(int, layout.split('x'))
-                fig, axs = plt.subplots(rows, cols, figsize=figsize, **kwargs)
-                if isinstance(axs, np.ndarray):
-                    ax_dict = {i: a for i, a in enumerate(axs.flatten())}
-                else:
-                    ax_dict = {0: axs}
-
-            if squared:
-                for a in ax_dict.values():
-                    a.set_box_aspect(1)
-            
-            if 'adjust' in params:
-                fig.subplots_adjust(**params['adjust'])
-            
-            return fig, ax_dict
-        print(f"\n[Plotter.plot_any] Setting layout...")
-        fig, ax_dict = set_layout(layout_params or {})
-        
-        # 3. Populate Layout
-        def apply_plots(ax, plots, key):
-            for p in plots:
-                ptype = p.get('plot_type')
-
-                if ptype == 'line':
-                    _check_required_keys(p, ['x', 'y'], 'line', key)
-                    ax.plot(p['x'], p['y'], **get_kwargs(p, ['x', 'y']))
-                    
-                elif ptype == 'barh':
-                    _check_required_keys(p, ['y', 'width'], 'barh', key)
-                    if p.get('reverse', False):
-                        p['y'] = p['y'][::-1]
-                        p['width'] = p['width'][::-1]
-                        if 'color' in p and isinstance(p['color'], (list, np.ndarray, tuple)):
-                            p['color'] = p['color'][::-1]
-                        if 'edgecolor' in p and isinstance(p['edgecolor'], (list, np.ndarray, tuple)):
-                            p['edgecolor'] = p['edgecolor'][::-1]
-                    ax.barh(y=p['y'], width=p['width'], **get_kwargs(p, ['y', 'width', 'reverse']))
-                
-                elif ptype == 'barv':
-                    _check_required_keys(p, ['x', 'height'], 'barv', key)
-                    if p.get('reverse', False):
-                        p['x'] = p['x'][::-1]
-                        p['height'] = p['height'][::-1]
-                        if 'color' in p and isinstance(p['color'], (list, np.ndarray, tuple)):
-                            p['color'] = p['color'][::-1]
-                        if 'edgecolor' in p and isinstance(p['edgecolor'], (list, np.ndarray, tuple)):
-                            p['edgecolor'] = p['edgecolor'][::-1]
-                    ax.bar(x=p['x'], height=p['height'], **get_kwargs(p, ['x', 'height', 'reverse']))
-                    
-                elif ptype == 'hist':
-                    _check_required_keys(p, ['dataset'], 'hist', key)
-                    ax.hist(p['dataset'], **get_kwargs(p, ['dataset']))
-                    
-                elif ptype == 'vline':
-                    _check_required_keys(p, ['x'], 'vline', key)
-                    ax.axvline(x=p['x'], **get_kwargs(p, ['x']))
-                    
-                elif ptype == 'hline':
-                    _check_required_keys(p, ['y'], 'hline', key)
-                    ax.axhline(y=p['y'], **get_kwargs(p, ['y']))
-                    
-                elif ptype == 'fill':
-                    _check_required_keys(p, ['x', 'y1', 'y2'], 'fill', key)
-                    ax.fill_between(x=p['x'], y1=p['y1'], y2=p['y2'], **get_kwargs(p, ['x', 'y1', 'y2']))
-                
-                elif ptype == 'vspan':
-                    _check_required_keys(p, ['x1', 'x2'], 'vspan', key)
-                    ax.axvspan(p['x1'], p['x2'], **get_kwargs(p, ['x1', 'x2']))
-                    
-                elif ptype == 'hspan':
-                    _check_required_keys(p, ['y1', 'y2'], 'hspan', key)
-                    ax.axhspan(p['y1'], p['y2'], **get_kwargs(p, ['y1', 'y2']))
-                    
-                elif ptype == 'scatter':
-                    _check_required_keys(p, ['x', 'y'], 'scatter', key)
-                    ax.scatter(p['x'], p['y'], **get_kwargs(p, ['x', 'y']))
-                    
-                elif ptype == 'violin':
-                    _check_required_keys(p, ['dataset', 'positions'], 'violin', key)
-                    kwargs = get_kwargs(p, ['dataset', 'positions'])
-                    color_input = kwargs.pop('color', None)
-                    vp = ax.violinplot(p['dataset'], p['positions'], **kwargs)
-                    if color_input:
-                        for i, body in enumerate(vp['bodies']):
-                            c = color_input[i] if isinstance(color_input, list) else color_input
-                            body.set_facecolor(c)
-                            body.set_edgecolor(c)
-                            body.set_alpha(kwargs.get('alpha', 0.7))
-                        for part in ['cbars', 'cmins', 'cmaxes', 'cmeans', 'cmedians']:
-                            if part in vp:
-                                vp[part].set_edgecolor('black')
-                                vp[part].set_linewidth(0.5)
-                
-                elif ptype == 'text':
-                    _check_required_keys(p, ['x', 'y', 'text'], 'text', key)
-                    kwargs = get_kwargs(p, ['x', 'y', 'text', 'transform'])
-                    transform = p.get('transform', ax.transAxes)
-                    if transform == 'data':
-                        transform = ax.transData
-                    ax.text(p['x'], p['y'], p['text'], transform=transform, **kwargs)
-                
-                elif ptype == 'gdf_shp':
-                    _check_required_keys(p, ['gdf'], 'gdf_shp', key)
-                    p['gdf'].plot(ax=ax, **get_kwargs(p, ['gdf']))
-                
-                elif ptype == 'imshow':
-                    _check_required_keys(p, ['image', 'extent'], 'imshow', key)
-                    ax.imshow(p['image'], extent=p['extent'], origin='upper', **get_kwargs(p, ['image', 'extent', 'origin']))
-                
-                elif ptype == 'wms':
-                    from io import BytesIO
-                    import matplotlib.image as mpimg
-                    from owslib.wms import WebMapService
-
-                    _check_required_keys(p, ['url', 'layers', 'extent'], 'wms', key)
-                    wms = WebMapService(p['url'], version=p.get('version', '1.1.1'))
-                    extent = p['extent']
-                    bbox = (extent[0], extent[2], extent[1], extent[3])
-                    img_request = wms.getmap(
-                        layers=p['layers'],
-                        srs=p.get('crs', 'EPSG:4326'), 
-                        bbox=bbox,
-                        size=p.get('size', (1000, 1000)), 
-                        format=p.get('format', 'image/png'),
-                        transparent=p.get('transparent', True)
-                    )
-                    img_data = mpimg.imread(BytesIO(img_request.read()))
-                    ax.set_facecolor('black')
-                    ax.imshow(img_data, extent=extent, origin='upper',
-                              **get_kwargs(p, ['url', 'layers', 'extent'] + ['version', 'crs', 'size', 'format', 'transparent']))
-                
-                elif ptype == 'sankey':
-                    from matplotlib.path import Path
-                    import matplotlib.patches as patches
-
-                    _check_required_keys(p, ['nodes', 'links'], 'sankey', key)
-                    
-                    nodes_list = p['nodes'] 
-                    links_list = p['links'] 
-                    
-                    # 1. Draw the connection streams (Links) using Bezier paths
-                    for link in links_list:
-                        # FIX: Correctly extract the individual dictionary node using its integer ID
-                        src = nodes_list[link['source']]
-                        tgt = nodes_list[link['target']]
-                        
-                        x0, y0 = src['x'], link.get('src_y', src['y'])
-                        x1, y1 = tgt['x'], link.get('tgt_y', tgt['y'])
-                        
-                        w_src = link.get('value_src', link.get('value', 0))
-                        w_tgt = link.get('value_tgt', link.get('value', 0))
-                        
-                        cx0 = x0 + (x1 - x0) / 2
-                        cx1 = x1 - (x1 - x0) / 2
-                        
-                        verts = [
-                            (x0, y0),
-                            (cx0, y0), (cx1, y1), (x1, y1),
-                            (x1, y1 + w_tgt),
-                            (cx1, y1 + w_tgt), (cx0, y0 + w_src), (x0, y0 + w_src),
-                            (x0, y0)
-                        ]
-                        
-                        codes = [
-                            Path.MOVETO,
-                            Path.CURVE4, Path.CURVE4, Path.CURVE4,
-                            Path.LINETO,
-                            Path.CURVE4, Path.CURVE4, Path.CURVE4,
-                            Path.CLOSEPOLY
-                        ]
-                        
-                        path = Path(verts, codes)
-                        patch = patches.PathPatch(
-                            path, 
-                            facecolor=link.get('color', '#cccccc'), 
-                            alpha=link.get('alpha', 0.4), 
-                            edgecolor='none'
-                        )
-                        ax.add_patch(patch)
-                    
-                    # 2. Draw the vertical blocks (Nodes)
-                    for node in nodes_list:
-                        rect = patches.Rectangle(
-                            (node['x'] - p.get('node_width', 0.02), node['y']),
-                            p.get('node_width', 0.02) * 2,
-                            node['h'],
-                            facecolor=node.get('color', '#555555'),
-                            edgecolor=node.get('edgecolor', p.get('node_edgecolor', 'black')),
-                            linewidth=node.get('linewidth', p.get('node_linewidth', 0.5)),
-                            alpha=node.get('alpha', 1.0)
-                        )
-                        ax.add_patch(rect)
-                        
-                        if node['h'] < 0.005:
-                            continue
-                            
-                        if node['x'] < 0.2:
-                            ha_dir = 'right'; offset = -0.025
-                        elif node['x'] > 0.8:
-                            ha_dir = 'left'; offset = 0.025
-                        else:
-                            ha_dir = 'center'; offset = 0.0
-                            
-                        y_pos = node['y'] + node['h']/2 if ha_dir != 'center' else node['y'] + node['h'] + 0.01
-                        
-                        ax.text(
-                            node['x'] + offset, y_pos, node['name'], 
-                            va='center', ha=ha_dir, fontsize=p.get('fontsize', 8)
-                        )
-                
-                else:
-                    print(f"Warning: plot_type '{ptype}' in axis '{key}' still not implemented.")
-        
-        def apply_style(ax, styles, key):
-            for s in styles:
-                stype = s.get('style_type')
-
-                if stype == 'title':
-                    ax.set_title(s.get('label', ''), **get_kwargs(s, ['label']))
-                    
-                elif stype in ['xlabel', 'ylabel']:
-                    getattr(ax, f'set_{stype}')(s.get('label', ''), **get_kwargs(s, ['label']))
-                    
-                elif stype in ['xlim', 'ylim', 'xscale', 'yscale']:
-                    getattr(ax, f'set_{stype}')(**get_kwargs(s, []))
-                    
-                elif stype in ['xticks', 'yticks']:
-                    getattr(ax, f'set_{stype}')(s.get('ticks', []), **get_kwargs(s, ['ticks']))
-                    
-                elif stype in ['xticklabels', 'yticklabels']:
-                    getattr(ax, f'set_{stype}')(s.get('labels', []), **get_kwargs(s, ['labels']))
-                
-                elif stype == 'ticks_params':
-                    ax.tick_params(**get_kwargs(s, []))
-                
-                elif stype == 'ticklabel_format':
-                    ax.ticklabel_format(**get_kwargs(s, []))
-                
-                elif stype == 'minor_locator':
-                    import matplotlib.ticker as ticker
-                    axis_name = s.get('axis', 'both')
-                    loc_type = s.get('locator_type', 'log')
-                    
-                    def apply_axis_locator(target_axis_obj):
-                        if loc_type == 'log':
-                            base_val = s.get('base', 10.0)
-                            subs_val = s.get('subs', range(1, 10))
-                            target_axis_obj.set_minor_locator(ticker.LogLocator(base=base_val, subs=subs_val))
-                        elif loc_type == 'null':
-                            target_axis_obj.set_minor_locator(ticker.NullLocator())
-
-                    if axis_name in ['x', 'both']: apply_axis_locator(ax.xaxis)
-                    if axis_name in ['y', 'both']: apply_axis_locator(ax.yaxis)
-                
-                elif stype == 'major_formatter':
-                    import matplotlib.ticker as ticker
-                    axis_name = s.get('axis', 'both')
-                    formatter_type = s.get('formatter_type', 'object')
-
-                    def apply_axis_formatter(target_axis_obj):
-                        if formatter_type == 'dms_suffix':
-                            from math import isclose
-                            
-                            suffix = s.get('suffix', '')
-                            def create_dms_formatter(curr_axis, curr_suffix):
-                                def format_dms(value, pos):
-                                    abs_val = abs(value)
-                                    deg = int(abs_val)
-                                    min_float = (abs_val - deg) * 60
-                                    minutes = int(min_float)
-                                    seconds = round((min_float - minutes) * 60)
-                                    if seconds == 60: seconds = 0; minutes += 1
-                                    if minutes == 60: minutes = 0; deg += 1
-                                        
-                                    base_str = f"{deg:g}º{minutes:02d}'{seconds:02d}''"
-                                    
-                                    tick_locs = curr_axis.get_majorticklocs()
-                                    vmin, vmax = curr_axis.get_view_interval()
-                                    view_min, view_max = min(vmin, vmax), max(vmin, vmax)
-                                    
-                                    tol = 1e-5 * (view_max - view_min) if view_max != view_min else 1e-5
-                                    visible_ticks = [t for t in tick_locs if (view_min - tol) <= t <= (view_max + tol)]
-                                    
-                                    if visible_ticks and isclose(value, max(visible_ticks), rel_tol=1e-5, abs_tol=1e-8):
-                                        return f"{base_str}{curr_suffix}"
-                                    return base_str
-                                return ticker.FuncFormatter(format_dms)
-                            formatter = create_dms_formatter(target_axis_obj, suffix)
-                            
-                        elif formatter_type == 'string':
-                            formatter = ticker.StrMethodFormatter(s.get('format_str', '{x}'))
-                            
-                        else:
-                            formatter = s.get('formatter_obj', None)
-
-                        if formatter is not None:
-                            target_axis_obj.set_major_formatter(formatter)
-
-                    if axis_name in ['x', 'both']: apply_axis_formatter(ax.xaxis) 
-                    if axis_name in ['y', 'both']: apply_axis_formatter(ax.yaxis)
-                    
-                elif stype == 'offset_text':
-                    axis_name = s.get('axis', 'y')
-                    axis_obj = getattr(ax, f'{axis_name}axis')
-                    axis_obj.get_offset_text().set_fontsize(s.get('fontsize', 8))
-                
-                elif stype == 'grid':
-                    ax.grid(**get_kwargs(s, []))
-                
-                elif stype == 'spines':
-                    for spine, vis in get_kwargs(s, []).items():
-                        ax.spines[spine].set_visible(vis)
-                
-                elif stype == 'letter':
-                    ax.text(
-                        s.get('x', 0.02), s.get('y', 0.95), s.get('label', ''),
-                        transform=ax.transAxes, fontweight=s.get('fontweight', 'bold'),
-                        va='top', ha='left', **get_kwargs(s, ['x', 'y', 'label', 'fontweight', 'transform']))
-                
-                elif stype == 'aspect':
-                    ax.set_aspect(s.get('aspect', 'equal'))
-                
-                elif stype == 'off':
-                    ax.axis('off')
-                
-                elif stype == 'legend':
-                    ax.legend(
-                        loc=s.get('loc', 'best'),
-                        fontsize=s.get('fontsize', 10),
-                        title=s.get('title', None)
-                    )
-                
-                else:
-                    print(f"Warning: style_type '{stype}' in axis '{key}' still not implemented in plot_any.")
-        
-        def apply_legend(ax, legend, key):
-            import matplotlib.patches as patches
-            import matplotlib.lines as lines
-            from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-            for l in legend:
-                ltype = l.get('legend_type')
-                
-                if ltype == 'text':
-                    required = ['x', 'y', 'content']
-                    _check_required_keys(l, required, 'text', key)
-                    ax.text(l['x'], l['y'], l['content'], transform=ax.transAxes, **get_kwargs(l, required))
-                    
-                elif ltype == 'circle':
-                    required = ['x', 'y', 'radius', 'color']
-                    _check_required_keys(l, required, 'circle', key)
-                    circ = patches.Circle((l['x'], l['y']), l['radius'], color=l['color'],
-                                          transform=ax.transAxes, clip_on=False, **get_kwargs(l, required))
-                    ax.add_patch(circ)
-                
-                elif ltype == 'rectangle':
-                    required = ['x', 'y', 'width', 'height', 'color']
-                    _check_required_keys(l, required, 'square', key)
-                    rect = patches.Rectangle((l['x'], l['y']), l['width'], l['height'], 
-                                            color=l['color'], transform=ax.transAxes, clip_on=False,
-                                            **get_kwargs(l, required))
-                    ax.add_patch(rect)
-                    
-                elif ltype == 'line':
-                    required = ['x', 'y', 'length', 'color']
-                    _check_required_keys(l, required, 'line', key)
-                    line = lines.Line2D([l['x'], l['x'] + l['length']], [l['y'], l['y']], color=l['color'],
-                                        transform=ax.transAxes, clip_on=False, **get_kwargs(l, required))
-                    ax.add_line(line)
-                    
-                elif ltype == 'gdf_gradient':
-                    required = ['x', 'y', 'w', 'h', 'source_ax']
-                    _check_required_keys(l, required, 'gdf_gradient', key)
-                    if l['source_ax'] in ax_dict:
-                        for art in ax_dict[l['source_ax']].collections:
-                            if hasattr(art, 'cmap'):
-                                cax = inset_axes(ax, width=f"{l['w']*100}%", height=f"{l['h']*100}%", loc='lower left', 
-                                                 bbox_to_anchor=(l['x'], l['y'], 1, 1), bbox_transform=ax.transAxes, borderpad=0)
-                                plt.colorbar(art, cax=cax, **get_kwargs(l, required))
-                                break
-                
-                elif ltype == 'north_arrow':
-                    _check_required_keys(l, ['x', 'y'], 'north_arrow', key)
-                    transform = l.get('transform', ax.transAxes)
-                    length = l.get('length', 0.05)
-                    pad = l.get('pad', 0.005)
-                    color = l.get('color', 'black')
-                    fontsize = l.get('fontsize', 8)
-                    
-                    ax.text(l['x'], l['y'], 'N', transform=transform, ha='center', va='bottom',
-                            fontsize=fontsize, fontweight='bold', color=color)
-                    ax.annotate('', xy=(l['x'], l['y'] - pad), xytext=(l['x'], l['y'] - pad - length),
-                                xycoords=transform, textcoords=transform,
-                                arrowprops=dict(facecolor=color, edgecolor=color,
-                                headwidth=5, width=1.5, headlength=5, shrinkA=0, shrinkB=0))
-                
-                elif ltype == 'scalebar':
-                    from matplotlib_scalebar.scalebar import ScaleBar
-                    _check_required_keys(l, ['dx'], 'scalebar', key)
-                    kwargs = get_kwargs(l, ['dx'])
-                    sb = ScaleBar(dx=l['dx'], **kwargs)
-                    ax.add_artist(sb)
-                
-                else:
-                    print(f"Warning: legend_type '{ltype}' in axis '{key}' still not implemented in plot_any.")
-                
-        for key, config in dict_to_plot.items():
-            if key in ax_dict:
-                print(f"\n[Plotter.plot_any] Applying plots to axis '{key}'...")
-                if 'plots' in config: apply_plots(ax_dict[key], config.get('plots', []), key)
-                print(f"\n[Plotter.plot_any] Applying style to axis '{key}'...")
-                if 'style' in config: apply_style(ax_dict[key], config.get('style', []), key)
-                print(f"\n[Plotter.plot_any] Applying legend to axis '{key}'...")
-                if 'legend' in config: apply_legend(ax_dict[key], config.get('legend', []), key)
-        
-        # 4. Apply global style
-        def apply_global_figure_style(fig, global_style):
-            if global_style:
-                for s in global_style:
-                    gstype = s.get('gstype')
-                    label = s.get('label', '')
-                    kwargs = get_kwargs(s, ['label'])
-                    if gstype in ['suptitle', 'supxlabel', 'supylabel']:
-                        getattr(fig, gstype)(label, **kwargs)
-        print(f"\n[Plotter.plot_any] Setting global style...")
-        apply_global_figure_style(fig, global_style)
-        
-        # 5. Save Plot
-        print(f"\n[Plotter.plot_any] Saving plot...")
-        def save_plot(fig, params):
-            path = os.path.join(params.get('output_dir', '.'), params.get('subfolder', ''))
-            if not os.path.exists(path):
-                os.makedirs(path)
-            
-            if params.get('tight_layout', False):
-                fig.tight_layout()
-            
-            fig.savefig(
-                os.path.join(path, params.get('fname', 'plot.png')), 
-                bbox_inches='tight',
-                dpi=params.get('dpi', 300),
-                pad_inches=params.get('pad', 0.1)
-            )
-            print(f"\n[Plotter.plot_any.save_plot] Plot saved at {path}")
-            if params.get('show', True):
-                plt.show()
-            else:
-                plt.close()
-        
-        save_plot(fig, save_params)
-
-        return fig, ax_dict
-    
-    def init_dic(self, dict_to_plot, ax, key):
-        """Initializes empty metadata sub-containers safely within target configurations."""
-        if ax not in dict_to_plot:
-            dict_to_plot[ax] = {}
-        dict_to_plot[ax][key] = []
-
-    def get_ax_ratio(self, layout_params, ax):
-        """Calculates the physical window aspect bounding-box ratio of a designated layout canvas."""
-        fig, ax_dict = plt.subplot_mosaic(layout_params['mosaic_structure'], figsize=layout_params['figsize'], **layout_params.get('kwargs', {}))
-        fig.subplots_adjust(**layout_params.get('adjust', {}))
-        plt.draw() 
-        bbox = ax_dict[ax].get_window_extent()
-        real_ratio = bbox.width / bbox.height
-        plt.close(fig)
-        return real_ratio
-
-    def calc_map_extent(self, top_left_x, top_left_y, zoom_pct, real_ratio, base_span=0.02):
-        """Transforms degree minute coordinates into geographic coordinate system map bounds."""
-        xmin = -(top_left_x[0] + top_left_x[1]/60 + top_left_x[2]/3600)
-        ymax = (top_left_y[0] + top_left_y[1]/60 + top_left_y[2]/3600)
-        width = base_span * (zoom_pct / 100)
-        height = width / real_ratio 
-        return [xmin, xmin + width, ymax - height, ymax]
-
-    def get_dx_for_scalebar(self, extent, crs='EPSG:4326'):
-        """Calculates physical conversion factors per data coordinate unit for map scalebars."""
-        if crs == 'EPSG:4326':
-            mid_lat = (extent[2] + extent[3]) / 2
-            return (math.pi / 180.0) * 6378137.0 * math.cos(math.radians(mid_lat))
-        return 1.0
-
-    def create_2_linear_ax_scale(self, max_val, split, pct):
-        """Builds forwarding/reversing structural mappings for segmented axis stretching."""
-        fwd = lambda x: np.where(x <= split, (pct / split) * x, pct + ((1.0 - pct) / (max_val - split)) * (x - split))
-        rev = lambda y: np.where(y <= pct, (split / pct) * y, split + ((max_val - split) / (1.0 - pct)) * (y - pct))
-        return (fwd, rev)
-
-    def create_3_linear_ax_scale(self, max_val, split1, split2, pct1, pct2):
-        """Constructs three-segment piecewise scales to zoom axis sub-segments."""
-        def forward_scale(x):
-            x = np.asarray(x, dtype=float)
-            conds = [x <= split1, (x > split1) & (x <= split2), x > split2]
-            funcs = [(pct1 / split1) * x, pct1 + ((pct2 - pct1) / (split2 - split1)) * (x - split1), pct2 + ((1.0 - pct2) / (max_val - split2)) * (x - split2)]
-            return np.select(conds, funcs, default=x)
-        def inverse_scale(y):
-            y = np.asarray(y, dtype=float)
-            conds = [y <= pct1, (y > pct1) & (y <= pct2), y > pct2]
-            funcs = [(split1 / pct1) * y, split1 + ((split2 - split1) / (pct2 - pct1)) * (y - pct1), split2 + ((max_val - split2) / (1.0 - pct2)) * (y - pct2)]
-            return np.select(conds, funcs, default=y)
-        return (forward_scale, inverse_scale)
-
-def _process_bid_worker(args, alphas, epsilons):
-    """Module-level un-nested standalone worker function for Vats criterion execution mapping."""
-    import numpy as np
-    from math import pi, gamma
-    from scipy.stats import f
-
-    subset, bid, n = args
-    alphas_processed = [a/100 for a in alphas]
-    epsilons_processed = [e/100 for e in epsilons]
-    
-    col_var = np.var(subset, axis=0)
-    active = col_var > 0
-    p_eff = int(active.sum())
-    
-    if p_eff < 2 or n <= p_eff:
-        return {"bid": bid, "status": "skipped", "logs": [f"Warning: n={n} <= p_eff={p_eff}"]}
-        
-    subset = subset[:, active].astype(np.float64)
-    cov = np.cov(subset, rowvar=False, ddof=1)
-    det = np.linalg.det(cov)
-    
-    if det <= 0:
-        return {"bid": bid, "status": "skipped", "logs": [f"Warning: Non-positive det={det:.2e}"]}
-        
-    unit_ball_vol = (pi ** (p_eff / 2)) / gamma(p_eff / 2 + 1)
-    metrics = {}
-    
-    for a in alphas_processed:
-        c_n = (p_eff * (n - 1) / (n - p_eff)) * f.ppf(1 - a, p_eff, n - p_eff)
-        metrics[f"lhs_{int(a*100):02d}"] = (unit_ball_vol * (c_n / n) ** (p_eff / 2) * (det ** 0.5)) ** (1 / p_eff) + 1 / n
-    for e in epsilons_processed:
-        metrics[f"rhs_{int(e*100):02d}"] = e * det ** (1 / (2 * p_eff))
-
-    residuals, active_statuses, overall_active = {}, {}, False
-    for a in alphas:
-        for e in epsilons:
-            suffix = f"a{a:02d}_e{e:02d}"
-            res_val = max(0.0, metrics[f"lhs_{a:02d}"] - metrics[f"rhs_{e:02d}"])
-            residuals[f"res_{suffix}"] = res_val
-            active_statuses[f"rem_{suffix}"] = 1 if res_val > 0 else 0
-            if res_val > 0: overall_active = True
-
-    return {
-        "status": "active" if overall_active else "converged", 
-        "bid": bid, "residuals": residuals, "active_counts": active_statuses, "logs": []
+    }
+    custom_style = {
+        "font.family": "sans-serif",
+        "font.size": 10,
+        "axes.linewidth": 1.0,
+        "axes.edgecolor": "black",
+        # Spines & Ticks pointing IN on all 4 borders
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+        "xtick.top": False,
+        "ytick.right": False,
+        "xtick.major.size": 5,
+        "xtick.minor.size": 3,
+        "ytick.major.size": 5,
+        "ytick.minor.size": 3,
+        "xtick.minor.visible": True,
+        "ytick.minor.visible": True,
+        # Grid aesthetics
+        "axes.grid": True,
+        "grid.linestyle": ":",
+        "grid.linewidth": 0.6,
+        "grid.color": "#bbb8b8",
+        "grid.alpha": 0.7,
     }
 
-if __name__ == "__main__":
-    None
-    # TEST in terminal: python -m src.valuation.results
+    # ------------------------------
+    ## 2. RESULTS
+    # ------------------------------
+    # region --- Add external results ---
+    # depth_samples and IRME_Ev_by_BID
+    depht_samples_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\intermediate\Depth_Samples.pkl"
+    pd_df = pd.read_pickle(depht_samples_path)
+    depht_samples_df = pl.from_pandas(pd_df) if isinstance(pd_df, pd.DataFrame) else pl.DataFrame(pd_df)
+    depht_samples_df = depht_samples_df.rename({"SN": "it"})
+
+    results.add_result(
+        res_name = "depth_samples",
+        res_description = "Depth samples from HEC-RAS Montecarlo",
+        data = depht_samples_df,
+    )
+    config = {
+        "convergence_targets": ["BID"],
+        "output_targets": ["he"],    
+        "return_period_col": "RP",
+        "tolerance_type": "absolut",
+        "tolerance_value": 0.1,
+        "metric": "mean",
+        "significance_level": 0.05,
+        "check_frequency": 50,
+    }
+    strategy = CLTUnivariateStrategy()
+    is_converged, evolution_df = strategy.calculate(depht_samples_df, config)
+    results.add_result(
+        res_name="IRME_Ev_by_BID",
+        res_description="""(external) HEC-RAS Monte Carlo IRME univariate metric evolution considering all BID""",
+        data=evolution_df,
+        overwrite=True
+    )
+
+    # IRRSDFV
+    try:
+        conv_df = results.get_result_as_df(res_name="convergence")
+        print("[IRRSDFV] 'convergence' already exists. Loaded from registry.")
+    except KeyError:
+        print("[IRRSDFV] 'convergence' not found. Calculating manually using CLTMultivariateStrategy...")
+        cost_cols = [
+            'c_APP', 'c_CLO', 'c_COM', 'c_DEC', 'c_ELE', 'c_ENG', 'c_FAD', 'c_FUR',
+            'c_HHG', 'c_HHB', 'c_INS', 'c_LEI', 'c_OTH', 'c_SPE', 'c_TOO', 'c_VEH',
+            'c_SKT', 'c_RDR', 'c_WND', 'c_PLG', 'c_SOI', 'c_PRW', 'c_ITP'
+        ]
+        multi_config = {
+            "convergence_targets": ["BID"],
+            "output_targets": cost_cols,
+            "method": "clt",
+            "return_period_col": "RP",
+            "metric": "mean",
+            "tolerance_value": 0.05,
+            "significance_level": 0.05,
+            "first_check_point": 100,
+            "check_frequency": 1000,
+        }
+        
+        needed_cols = list(dict.fromkeys(
+            multi_config.get("convergence_targets", []) + 
+            multi_config.get("output_targets", []) + 
+            [multi_config.get("return_period_col"), "it"]
+        ))
+        needed_cols = [col for col in needed_cols if col is not None]
+        
+        print(f"[IRRSDFV] Collecting required columns from chunked lazy frame: {needed_cols}")
+        df_conv_input = results.collect_data(columns=needed_cols)
+        
+        strategy_multi = CLTMultivariateStrategy()
+        is_converged, calculated_conv_df = strategy_multi.calculate(df_conv_input, multi_config) # type: ignore
+        
+        # 5. Save the processed metric directly into the PostProcessor registry
+        results.add_result(
+            res_name="convergence",
+            res_description="Manual CLT Multivariate convergence (IRRSDFV) fallback",
+            data=calculated_conv_df,
+            overwrite=True
+        )
+        print(f"[IRRSDFV] Manual calculation complete. Global convergence status: {is_converged}")
+
+    # input_flow_fit
+    if_fit_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\intermediate\Flow_Fitted_Functions.pkl"
+    pd_df = pd.read_pickle(if_fit_path)
+    pl_df = pl.from_pandas(pd_df) if isinstance(pd_df, pd.DataFrame) else pl.DataFrame(pd_df)
+    pl_df = pl_df.rename({"ReturnPeriod": "RP"}).with_columns(
+        pl.col("RP").replace(20, 25)
+    )
+    results.add_result(
+        res_name = "input_flow_fit",
+        res_description = """Input flow log-pearson type III parameters (Skew, Loc, Scale) by return
+        period used in HEC-RAS Montecarlo""",
+        data = pl_df,
+        overwrite=True
+    )
+
+    # Building shapefile (IDEA: Allow add to postprocessor)
+    bid_shp = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\inputs\gis\BID\BIDs_v2.3.shp"
+    raw_gdf = gpd.read_file(bid_shp)
+    raw_gdf["geometry"] = raw_gdf.geometry.centroid
+    raw_gdf = raw_gdf.to_crs(epsg=4326)
+    # endregion
+
+    # region --- Internal helpers ---
+    def _init_fig(figsize, clean:bool):
+        if clean:
+            fig, ax = plt.subplots(figsize=figsize, layout="constrained")
+        else: 
+            fig, ax = plt.subplots(figsize=figsize)
+        return fig, ax
+
+    def _savefig(fig, png_path, clean, show):
+        Path(png_path).parent.mkdir(parents=True, exist_ok=True)
+        if clean:
+            fig.savefig(png_path, dpi=300)
+        else:
+            fig.savefig(png_path, dpi=300, bbox_inches="tight")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+    def _simplify_flood_contour(shp, clip_bounds=None):
+        if clip_bounds is not None:
+            clip_box = box(*clip_bounds)
+            shp = shp.clip(clip_box)
+        shp = shp.explode(index_parts=False)
+        shp.geometry = shp.geometry.apply(
+            lambda poly: Polygon(poly.exterior) if poly.interiors else poly
+        )
+        shp = shp[shp.geometry.area > 1e-7]
+        shp = shp.union_all()
+        shp = shp.simplify(tolerance=0.00011, preserve_topology=True)
+        shp = gpd.GeoDataFrame(geometry=[shp], crs="EPSG:4326")
+        return shp
+
+    def _tif_to_simplified_shp(tif_path, clip_bounds=None):
+        with rasterio.open(tif_path) as src:
+            arr = src.read(1)
+            
+            nodata = src.nodata
+            if nodata is not None:
+                mask = (arr != nodata) & (~np.isnan(arr)) if np.issubdtype(arr.dtype, np.floating) else (arr != nodata)
+            else:
+                mask = (arr > 0) if np.issubdtype(arr.dtype, np.number) else (arr != 0)
+                
+            shape_gen = features.shapes(mask.astype(np.uint8), transform=src.transform)
+            
+            records = [
+                {'geometry': shape(geom), 'value': value}
+                for geom, value in shape_gen if value == 1
+            ]
+            
+            shp = gpd.GeoDataFrame(records, crs="EPSG:25830")
+            
+            # 2. Now properly convert the meters to WGS84 degrees
+            shp = shp.to_crs("EPSG:4326")
+            
+        return _simplify_flood_contour(shp, clip_bounds=clip_bounds)
+
+    def _to_dms(val, pos):
+        """Convert decimal degrees to standard DMS (º ' '') string."""
+        sign = "-" if val < 0 else ""
+        abs_val = abs(val)
+        
+        degrees = int(abs_val)
+        minutes_float = (abs_val - degrees) * 60
+        minutes = int(minutes_float)
+        seconds = round((minutes_float - minutes) * 60)
+        
+        # Handle rollover from rounding seconds
+        if seconds == 60:
+            seconds = 0
+            minutes += 1
+        if minutes == 60:
+            minutes = 0
+            degrees += 1
+            
+        if seconds == 0:
+            return f"{sign}{degrees}º{minutes:02d}'"
+        return f"{sign}{degrees}º{minutes:02d}'{seconds:02d}''"
+    # endregion
+
+    # ------------------------------
+    # region 2.1 CONVERGENCE (Figure 5)
+    # ------------------------------
+    # depth_Ev_by_BID
+    res = results.calc_metric(
+        res_name="depth_Ev_by_BID",
+        res_description= """(external) HEC-RAS Monte Carlo average value evolution at global level, summing the FID and averaging the BID
+        levels, calculatin comulative over iterations for each return period. Commonly used to visuallyze
+        estability of monte carlo as more simulations are added""",
+        target_col="he",
+        levels={1: "RP", 2: "BID"},
+        level = 1,
+        level_calc_type={1: None, 2: "mean",},
+        return_period_col="RP",
+        evolution_col="it",
+        custom_data = depht_samples_df,
+    )
+    df1=results.get_result_as_df(res_name="IRME_Ev_by_BID")
+    df2=results.get_result_as_df(res_name="depth_Ev_by_BID")
+    df2_fix = df2.join(df1.select(["RP", "it", "IRME", "CONV"]), on=["RP", "it"], how="left")
+    results.add_result(
+        res_name="depth_Ev_by_BID",
+        res_description="""(external) HEC-RAS Monte Carlo average value evolution at global level, summing the FID and averaging the BID
+        levels, calculatin comulative over iterations for each return period. Commonly used to visuallyze
+        estability of monte carlo as more simulations are added""",
+        data=df2_fix,
+        overwrite=True,
+    )
+
+    # convergence (IRRSDFV)
+    # plot
+    print(results.get_result_as_df(res_name="convergence"))
+    results.plot(
+        res_name = "convergence",
+        chart_type = "montecarlo_convergence_evolution",
+        figsize = (3.5, 2),
+        color_dic = color_dic,
+        custom_style = custom_style,
+        return_period = "RP",
+        x_col = "it",
+        y_col = "IRRSDFV",
+        warm_up = 100,
+        convergence_col_val = {"CONV":True},
+        ax_properties={
+            "constant":{
+                "xscale": "log",
+                "yscale": "log",
+                "xlim": (2, 10000),
+                "ylim": (1, 41000),
+            },
+        }
+    )
+
+    # cost_Ev_by_BID
+    results.add_result(
+        res_name="cost_Ev_by_BID",
+        res_description="""Monte Carlo cost evolution (cumulative average cost per BID) for each return period over iterations""",
+        data=(
+            results.collect_data(columns=['it', 'RP', 'BID', 'FID', 'c_total'])
+            .with_columns( # type: ignore
+                pl.col("BID").n_unique().over("RP").alias("num_bids")
+            )
+            .group_by(["RP", "it", "num_bids"]) 
+            .agg(pl.col("c_total").sum().alias("municipality_damage"))
+            .with_columns(
+                (pl.col("municipality_damage") / pl.col("num_bids")).alias("iteration_avg_damage")
+            )
+            .sort(["RP", "it"])
+            .with_columns(
+                (pl.col("iteration_avg_damage").cum_sum().over("RP") / pl.col("iteration_avg_damage").cum_count().over("RP"))
+                .alias("cumulative_mean_cost")
+            )
+            .select(["RP", "it", "cumulative_mean_cost"])
+        ),
+        overwrite=True,
+    )
+
+    # Plot
+    cost_Ev_by_BID = results.get_result_as_df(res_name="cost_Ev_by_BID")
+    def cost_evolution_plot(data, figsize, clean: bool, show: bool, warm_up: int | None = 100):
+        return_periods = sorted(data["RP"].unique().to_list())
+
+        with plt.rc_context(custom_style): # type: ignore
+            fig, ax = _init_fig(figsize, clean)
+
+            for rp in return_periods:
+                df_rp = data.filter(pl.col("RP") == rp)
+                x = df_rp["it"].to_numpy()
+                y = df_rp["cumulative_mean_cost"].to_numpy()
+
+                rp_color = color_dic["RP"].get(rp, "gray")
+
+                # PLOT Evolution Line for each RP
+                ax.plot(
+                    x,
+                    y,
+                    color=rp_color,
+                    linestyle="-",
+                    linewidth=1.2,
+                    label=f"RP {rp}"
+                )
+
+            # Warm-up shading on the left side
+            if warm_up is not None and warm_up > 0:
+                ax.axvspan(1, warm_up, alpha=0.2, color="#cccccc", label="warm-up", zorder=0)
+
+            # Use log scale for simulation number to match standard convergence layout
+            ax.set_xscale("log")
+            ax.set_xlim(left=2, right=12000)
+
+            # STYLE
+            if not clean:
+                ax.set(
+                    xlabel="Simulation Number",
+                    ylabel="Average Spatial Damage (€/building)",
+                    title="Cost Evolution Convergence",
+                )
+                ax.legend(
+                    loc="upper left",
+                    bbox_to_anchor=(1.04, 1.0),
+                    fontsize=8,
+                    framealpha=0.9,
+                    borderaxespad=0,
+                )
+            else:
+                ax.set(
+                    xticklabels=[],
+                    yticklabels=[],
+                )
+                ax.tick_params(axis="both", which="both", labelbottom=False, labelleft=False)
+
+            # SAVE
+            base_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\postprocessor\convergence\F5_CostEvolution"
+            png_path = (
+                f"{base_path}.png"
+                if not clean
+                else f"{base_path}_clean.png"
+            )
+            _savefig(fig, png_path, clean, show)
+    cost_evolution_plot(cost_Ev_by_BID, figsize=(2.8, 1.6), clean=False, show=False)
+    cost_evolution_plot(cost_Ev_by_BID, figsize=(2.8, 1.6), clean=True, show=False)
+
+    # Convergence: IRME
+    print(results.get_result_as_df(res_name="IRME_Ev_by_BID"))
+    results.plot(
+        res_name = "IRME_Ev_by_BID",
+        chart_type = "montecarlo_convergence_evolution",
+        figsize = (3.5, 2),
+        color_dic = color_dic,
+        custom_style = custom_style,
+        return_period = "RP",
+        x_col = "it",
+        y_col = "IRME",
+        warm_up = 30,
+        convergence_col_val = {"CONV":True},
+        ax_properties={
+            "constant":{
+                "xscale": "log",
+                "yscale": "log",
+                "xlim": (2, 1296),
+                "ylim": (1, 555),
+            },
+        }
+    )
+
+    # Convergence: Average Spatial Depht
+    print(results.get_result_as_df(res_name="depth_Ev_by_BID"))
+    results.plot(
+        res_name = "depth_Ev_by_BID",
+        chart_type = "montecarlo_convergence_evolution",
+        figsize = (3.5, 2),
+        color_dic = color_dic,
+        custom_style = custom_style,
+        return_period = "RP",
+        x_col = "it",
+        y_col = "he",
+        warm_up = 30,
+        convergence_col_val = {"CONV":True},
+        ax_properties={
+            "constant":{
+                "xscale": "log",
+                "yscale": {"value": "symlog", "linthresh": 0.01, "linscale": 0.5},
+                "xlim": (2, 1296),
+                "ylim": (0, 0.6),
+            },
+        }
+    )
+    # endregion
+
+    # ------------------------------
+    # region 2.2 DAMAGE MAP (Figure 6)
+    # ------------------------------
+    # --- LORENZ CURVE (BID) ---
+    # lorenz_curve_cost_BID
+    results.add_result(
+        res_name="lorenz_curve_cost_BID",
+        res_description="""Monte Carlo lorenz curve for total damage by bid for each return period""",
+        data=(
+            results.collect_data(columns = ['it', 'RP', 'BID', 'FID', 'c_total'])
+            .group_by(["RP", "it", "BID"]) # type: ignore
+            .agg(pl.col("c_total").sum().alias("bid_damage"))
+            .group_by(["RP", "BID"])
+            .agg([
+                pl.col("bid_damage").quantile(0.05).alias("q05"),
+                pl.col("bid_damage").quantile(0.50).alias("q50"),
+                pl.col("bid_damage").quantile(0.95).alias("q95"),
+            ])
+            .unpivot(
+                index=["RP", "BID"],
+                on=["q05", "q50", "q95"],
+                variable_name="quantile",
+                value_name="damage",
+            )
+            .sort(["RP", "quantile", "damage"])
+            .with_columns(
+                pl.col("damage").sum().over(["RP", "quantile"]).alias("total_damage"),
+                (
+                    pl.int_range(1, pl.len() + 1).over(["RP", "quantile"])
+                    / pl.len().over(["RP", "quantile"])
+                ).alias("lorenz_x"),
+            )
+            .with_columns(
+                (pl.col("damage").cum_sum().over(["RP", "quantile"]) / pl.col("total_damage"))
+                .fill_nan(0.0)
+                .alias("lorenz_y")
+            )
+            .select(["RP", "quantile", "BID", "damage", "total_damage", "lorenz_x", "lorenz_y"])
+            .sort(["RP", "quantile", "lorenz_y"])
+        ),
+        overwrite=True,
+    )
+
+    # Plot
+    lorenz_curve_cost_BID = results.get_result_as_df(res_name = "lorenz_curve_cost_BID")
+    def lorenz_curve_plot(data, figsize, clean: bool, show: bool):
+        # Get source data from results object
+        return_periods = data["RP"].unique().to_list()
+
+        with plt.rc_context(custom_style):  # type: ignore
+            for rp in return_periods:
+                # FIG
+                fig, ax = _init_fig(figsize, clean)
+
+                # Filter dataset for the specific RP
+                df_rp = data.filter(pl.col("RP") == rp)
+
+                # Extract x and y coordinates per quantile
+                x = df_rp.filter(pl.col("quantile") == "q50")["lorenz_x"].to_numpy()
+                q05_y = df_rp.filter(pl.col("quantile") == "q05")["lorenz_y"].to_numpy()
+                q50_y = df_rp.filter(pl.col("quantile") == "q50")["lorenz_y"].to_numpy()
+                q95_y = df_rp.filter(pl.col("quantile") == "q95")["lorenz_y"].to_numpy()
+
+                # PLOT
+                # 1. 1:1 Equality line (Diagonal)
+                ax.plot(
+                    [0, 1],
+                    [0, 1],
+                    color="black",
+                    linestyle="--",
+                    linewidth=1,
+                    label="Equality",
+                )
+
+                # 2. Lorenz Curve Confidence Interval (Q05 to Q95)
+                rp_color = color_dic["RP"].get(rp, "gray")
+                ax.fill_between(
+                    x,
+                    q05_y,
+                    q95_y,
+                    color=rp_color,
+                    alpha=0.35,
+                    edgecolor="none",
+                    label="Q05-Q95",
+                )
+
+                # 3. Lorenz Curve Median (Q50)
+                ax.plot(
+                    x,
+                    q50_y,
+                    color=rp_color,
+                    linestyle="-",
+                    linewidth=1.5,
+                    label="Q50",
+                )
+
+                # STYLE
+                ax.set(
+                    xlim=(0, 1),
+                    ylim=(0, 1),
+                    aspect="equal",
+                )
+
+                if not clean:
+                    ax.set(
+                        xlabel="Cumulative Share of BIDs",
+                        ylabel="Cumulative Share of Damage",
+                        title=f"Lorenz Curve (RP {rp})",
+                    )
+                else:
+                    ax.set(
+                        xticklabels=[],
+                        yticklabels=[],
+                    )
+
+                # SAVE
+                base_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\postprocessor\damage\F5_Lorenz"
+                png_path = (
+                    f"{base_path}_RP{rp}.png"
+                    if not clean
+                    else f"{base_path}_RP{rp}_clean.png"
+                )
+                _savefig(fig, png_path, clean, show)
+    lorenz_curve_plot(lorenz_curve_cost_BID, figsize=(1.8, 1.8), clean=False, show=False)
+    lorenz_curve_plot(lorenz_curve_cost_BID, figsize=(1.8, 1.8), clean=True, show=False)
+
+    # --- GINI COEFFICIENT (BID) ---
+    # gini_coefficient_cost_BID
+    results.add_result(
+        res_name="gini_coefficient_cost_BID",
+        res_description="""Monte Carlo gini coefficient for total damage by bid for each return period""",
+        data=(
+            lorenz_curve_cost_BID
+            .sort(["RP", "quantile", "lorenz_x"]) # type: ignore
+            .with_columns(
+                # Previous x and y points within each (RP, quantile) group
+                pl.col("lorenz_x").shift(1).fill_null(0.0).over(["RP", "quantile"]).alias("x_prev"),
+                pl.col("lorenz_y").shift(1).fill_null(0.0).over(["RP", "quantile"]).alias("y_prev"),
+            )
+            .with_columns(
+                # Trapezoidal area under the segment: (x_i - x_{i-1}) * (y_i + y_{i-1}) / 2
+                (
+                    (pl.col("lorenz_x") - pl.col("x_prev")) 
+                    * (pl.col("lorenz_y") + pl.col("y_prev")) 
+                    / 2.0
+                ).alias("trapezoid_area")
+            )
+            .group_by(["RP", "quantile"])
+            .agg([
+                # Gini = 1 - 2 * (Area under Lorenz Curve)
+                (1.0 - 2.0 * pl.col("trapezoid_area").sum())
+                .fill_nan(0.0)
+                .alias("gini_coefficient")
+            ])
+            .sort(["RP", "quantile"])
+        ),
+        overwrite=True,
+    )
+
+    # Plot
+    gini_coefficient_cost_BID = results.get_result_as_df(res_name = "gini_coefficient_cost_BID")
+    def gini_plot(data, figsize, clean: bool, show: bool):
+        # Pivot quantile values side-by-side per RP
+        df_gini = data.pivot(
+            on="quantile",
+            index="RP",
+            values="gini_coefficient"
+        ).sort("RP")
+
+        return_periods = df_gini["RP"].to_list()
+
+        with plt.rc_context(custom_style):  # type: ignore
+            for rp in return_periods:
+                # FIG
+                fig, ax = _init_fig(figsize, clean)
+
+                # Filter row for current RP
+                df_rp = df_gini.filter(pl.col("RP") == rp)
+
+                q05_val = df_rp["q05"].to_numpy()[0]
+                q50_val = df_rp["q50"].to_numpy()[0]
+                q95_val = df_rp["q95"].to_numpy()[0]
+
+                # PLOT
+                rp_color = color_dic["RP"].get(rp, "gray")
+                
+                # Single bar position centered at x = 0
+                x_center = 0.0
+                half_width = 0.35
+
+                # 1. Fill range between Q05 and Q95
+                y_min, y_max = min(q05_val, q95_val), max(q05_val, q95_val)
+                ax.fill_between(
+                    [x_center - half_width, x_center + half_width],
+                    y_min,
+                    y_max,
+                    color=rp_color,
+                    alpha=0.35,
+                    edgecolor="none",
+                    label="Q05-Q95"
+                )
+
+                # 2. Horizontal line for Q50 median
+                ax.hlines(
+                    y=q50_val,
+                    xmin=x_center - half_width,
+                    xmax=x_center + half_width,
+                    color=rp_color,
+                    linewidth=3.0,
+                    label="Q50"
+                )
+
+                # STYLE
+                ax.set(
+                    xlim=(-0.5, 0.5),
+                    ylim=(0, 1),
+                    xticks=[x_center],
+                    xticklabels=[f"RP {rp}"],
+                )
+
+                if not clean:
+                    ax.set(
+                        ylabel="Gini Coefficient",
+                        title=f"Gini Coefficient (RP {rp})",
+                    )
+                else:
+                    ax.set(
+                        xticklabels=[],
+                        yticklabels=[],
+                    )
+                
+                # SAVE
+                base_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\postprocessor\damage\F5_Gini"
+                png_path = (
+                    f"{base_path}_RP{rp}.png"
+                    if not clean
+                    else f"{base_path}_RP{rp}_clean.png"
+                )
+                _savefig(fig, png_path, clean, show)
+    gini_plot(gini_coefficient_cost_BID, figsize=(0.7, 1.8), clean=False, show=False)
+    gini_plot(gini_coefficient_cost_BID, figsize=(0.7, 1.8), clean=True, show=False)
+
+    # --- TOTAL DAMAGE DISTRIBUTION (BID STO) ---
+    # total_damage_cost_BID
+    results.add_result(
+        res_name="total_damage_cost_BID",
+        res_description="""Monte Carlo lorenz curve for total damage by bid for each return period""",
+        data=(
+            results.collect_data(columns = ['it', 'RP', 'BID', 'FID', 'c_total'])
+            .group_by(["RP", "it", "BID"]) # type: ignore
+            .agg(pl.col("c_total").sum().alias("bid_damage"))
+            .group_by(["RP", "BID"])
+            .agg([
+                pl.col("bid_damage").quantile(0.05).alias("q05"),
+                pl.col("bid_damage").quantile(0.50).alias("q50"),
+                pl.col("bid_damage").quantile(0.95).alias("q95"),
+            ])
+            .sort(["RP"])
+        ),
+        overwrite=True,
+    )
+
+    # Plot
+    total_damage_cost_BID = results.get_result_as_df(res_name = "total_damage_cost_BID")
+    def building_damage_quantile_plot(data, figsize, clean: bool, show: bool):
+        # Get all unique return periods ordered
+        return_periods = data["RP"].unique().sort().to_list()
+
+        # Dynamic global Y-limit
+        positive_damages = data.select(["q05", "q50", "q95"]).to_numpy().flatten()
+        positive_damages = positive_damages[positive_damages > 0]
+
+        if len(positive_damages) > 0:
+            global_max = positive_damages.max()
+            y_lim_max = 10 ** (np.ceil(np.log10(global_max)))
+        else:
+            y_lim_max = 10**5.5
+        
+        # Dynamic color pallete
+        base_cmap = plt.get_cmap("YlOrRd")
+        colors = base_cmap(np.linspace(0, 1, 256)) ** 2.1
+        darkened_YlOrRd = mcolors.LinearSegmentedColormap.from_list("DarkYlOrRd", colors)
+
+        # Plot
+        quantiles = ["Q05", "Q50", "Q95"]
+        x_positions = [0, 1, 2]
+        max_jitter = 0.35
+        
+        with plt.rc_context(custom_style):  # type: ignore
+            for rp in return_periods:
+                # FIG
+                fig, ax = _init_fig(figsize, clean)
+
+                # Filter data for current RP and unpivot to long format
+                df_rp = (
+                    data.filter(pl.col("RP") == rp)
+                    .unpivot(
+                        index=["RP", "BID"],
+                        on=["q05", "q50", "q95"],
+                        variable_name="quantile",
+                        value_name="damage",
+                    )
+                    .with_columns(
+                        pl.col("quantile").str.to_uppercase().alias("quantile")
+                    )
+                )
+                
+                # Define color
+                q50_vals = df_rp.filter(
+                    (pl.col("quantile") == "Q50") & (pl.col("damage") > 0)
+                )["damage"].to_numpy()
+                
+                if len(q50_vals) > 0:
+                    q50_log = np.log10(q50_vals)
+                    vmin = float(np.percentile(q50_log, 5))
+                    vcenter = float(np.percentile(q50_log, 50))
+                    vmax = float(np.percentile(q50_log, 95))
+                    
+                    if vmin >= vcenter:
+                        vmin = vcenter - 0.1
+                    if vmax <= vcenter:
+                        vmax = vcenter + 0.1
+                else:
+                    vmin, vcenter, vmax = 0, 0.5, 1
+                
+                norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=vcenter, vmax=vmax)
+                                
+                # PLOT each quantile column (Q05, Q50, Q95)
+                for i, q in enumerate(quantiles):
+                    # Filter positive damage values for log scale
+                    damage_vals = df_rp.filter(
+                        (pl.col("quantile") == q) & (pl.col("damage") > 0)
+                    )["damage"].to_numpy()
+
+                    if len(damage_vals) == 0:
+                        continue
+
+                    log_vals = np.log10(damage_vals)
+
+                    # Calculate density along log damage axis using histogram bins
+                    counts, bin_edges = np.histogram(log_vals, bins=35)
+                    bin_indices = np.digitize(log_vals, bin_edges[:-1]) - 1
+                    bin_indices = np.clip(bin_indices, 0, len(counts) - 1)
+
+                    # Scale jitter width proportionally to density
+                    densities = counts[bin_indices]
+                    jitter_widths = (
+                        np.sqrt(densities / densities.max()) * max_jitter
+                    )
+
+                    # Generate random offset based on density
+                    x_offsets = np.random.uniform(-jitter_widths, jitter_widths)
+                    x_coords = x_positions[i] + x_offsets
+
+                    # Scatter plot
+                    ax.scatter(
+                        x_coords,
+                        damage_vals,
+                        c=log_vals,
+                        cmap=darkened_YlOrRd,
+                        s=6,
+                        alpha=0.75,
+                        edgecolors="none",
+                        norm=norm,
+                    )
+
+                # STYLE
+                ax.set_yscale("log")
+                ax.yaxis.set_major_locator(ticker.LogLocator(base=10.0, numticks=10))
+                ax.yaxis.set_minor_locator(ticker.LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1, numticks=10)) # type: ignore
+                ax.set(
+                    xticks=x_positions,
+                    ylim=(10, y_lim_max),
+                )
+                ax.tick_params(
+                    axis="x",
+                    which="minor",
+                    bottom=False,
+                    top=False,
+                )
+
+                if not clean:
+                    ax.set(
+                        xticklabels=quantiles,
+                        xlabel="Building Damage Quantile",
+                        ylabel="Building Damage (€)",
+                        title=f"Building Damage Quantiles (RP {rp})",
+                    )
+                    
+                    sm = cm.ScalarMappable(cmap=darkened_YlOrRd, norm=norm)
+                    sm.set_array([])  # Dummy array for scalar mappable
+                    cbar = fig.colorbar(sm, ax=ax, pad=0.02)
+                    cbar_ticks = [vmin, vcenter, vmax]
+                    cbar.set_ticks(cbar_ticks)
+                    cbar.set_ticklabels([f"€10$^{{{t:.1f}}}$" for t in cbar_ticks])
+                    cbar.set_label("Damage Intensity (Log10 €)", rotation=270, labelpad=15)
+                    
+                else:
+                    ax.set(
+                        xticklabels=[],
+                        yticklabels=[],
+                    )
+
+                # SAVE
+                base_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\postprocessor\damage\F5_QuantileDist"
+                png_path = (
+                    f"{base_path}_RP{rp}.png"
+                    if not clean
+                    else f"{base_path}_RP{rp}_clean.png"
+                )
+                _savefig(fig, png_path, clean, show)
+    building_damage_quantile_plot(total_damage_cost_BID, figsize=(1.8, 1.8), clean=False, show=False)
+    building_damage_quantile_plot(total_damage_cost_BID, figsize=(1.8, 1.8), clean=True, show=False)
+
+    # --- TOTAL DAMAGE MAP COMPARISION (STO vs DET) ---
+    # Data
+    total_damage_cost_BID = results.get_result_as_df(res_name = "total_damage_cost_BID")
+    total_damage_cost_BID_pandas = (
+        total_damage_cost_BID.to_pandas()
+        .pivot(index="BID", columns="RP", values="q50")
+        .add_prefix("q50_RP_")
+        .rename_axis(columns=None)[["q50_RP_10", "q50_RP_50", "q50_RP_100", "q50_RP_500"]]
+        .reset_index()
+    )
+    gdf = raw_gdf.merge(
+        total_damage_cost_BID_pandas,
+        on="BID",
+        how="inner"
+    )
+
+    # Plot
+    def damage_map_plot(gdf_data, figsize, clean: bool, show: bool):
+        # Get all unique return periods ordered
+        return_periods = [500]
+        
+        # WMS request
+        wms_url = "https://www.ign.es/wms-inspire/pnoa-ma?request=GetCapabilities&service=WMS"
+        wms = WebMapService(wms_url, version="1.1.1")
+        xmin, ymin, xmax, ymax = gdf_data.total_bounds
+        x_pad = (xmax - xmin) * 0.05 if xmax != xmin else 0.01
+        y_pad = (ymax - ymin) * 0.05 if ymax != ymin else 0.01
+        xmin, xmax = xmin - x_pad, xmax + x_pad
+        ymin, ymax = ymin - y_pad, ymax + y_pad
+        extent = [xmin, xmax, ymin, ymax]
+        bbox = (extent[0], extent[2], extent[1], extent[3])
+        img_request = wms.getmap(
+            layers=["OI.OrthoimageCoverage"],
+            srs="EPSG:4326",
+            bbox=bbox,
+            size=(1000, 1000),
+            format="image/png",
+            transparent=True
+        )
+        img_data = mpimg.imread(BytesIO(img_request.read()))
+        
+        base_cmap = plt.get_cmap("YlOrRd")
+        colors = base_cmap(np.linspace(0, 1, 256)) ** 2.1
+        darkened_YlOrRd = mcolors.LinearSegmentedColormap.from_list("DarkYlOrRd", colors)
+        
+        clip_xmin, clip_ymin, clip_xmax, clip_ymax = gdf_data.total_bounds
+        print(clip_xmin, clip_ymin, clip_xmax, clip_ymax)
+        chart_style = {
+            **custom_style,
+            "xtick.top": True,
+            "xtick.bottom": False,
+            "xtick.labeltop": True,
+            "xtick.labelbottom": False,
+        }
+        with plt.rc_context(chart_style):  # type: ignore
+            for rp in return_periods:
+                # FIG
+                fig, ax = _init_fig(figsize, clean)
+
+                # Filter data
+                rp_col = f"q50_RP_{rp}"
+                gdf_valid = gdf_data.dropna(subset=[rp_col])
+                gdf_zero = gdf_valid[gdf_valid[rp_col] == 0]
+                gdf_pos = gdf_valid[gdf_valid[rp_col] > 0].copy()
+                gdf_pos["q50_log"] = np.log10(gdf_pos[rp_col])
+
+                # PLOT
+                # SHP (Damage)
+                q50_log_pos = gdf_pos["q50_log"].to_numpy()
+                vmin = float(np.percentile(q50_log_pos, 5))
+                vcenter = float(np.median(q50_log_pos))
+                vmax = float(np.percentile(q50_log_pos, 95))
+                if vmin >= vcenter:
+                    vmin = vcenter - 0.1
+                if vmax <= vcenter:
+                    vmax = vcenter + 0.1
+                norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=vcenter, vmax=vmax)
+
+                if not gdf_zero.empty:
+                    gdf_zero.plot(
+                        ax=ax,
+                        color="white",
+                        edgecolor="none",
+                        linewidth=0,
+                        markersize=6,
+                        zorder=2,
+                    )
+
+                if not gdf_pos.empty:
+                    gdf_pos.plot(
+                        column="q50_log",
+                        cmap=darkened_YlOrRd,
+                        norm=norm,
+                        markersize=9,
+                        legend=False,
+                        ax=ax,
+                        edgecolor="none",
+                        linewidth=0,
+                        zorder=3,
+                    )
+                
+                # WMS
+                ax.imshow(
+                    img_data, 
+                    extent=extent, # type: ignore
+                    origin="upper", 
+                    alpha=1.0, 
+                    zorder=0
+                )
+                
+                # Q50 depth
+                tif_path = STO_TIF[rp]["Q50"]
+                dst_crs = "EPSG:4326"
+                with rasterio.open(tif_path) as src:
+                    def_transform, _, _ = calculate_default_transform(
+                        src.crs, dst_crs, src.width, src.height, *src.bounds
+                    )
+                    res_x = abs(def_transform.a)
+                    res_y = abs(def_transform.e)
+                    width = max(1, int(np.ceil((clip_xmax - clip_xmin) / res_x)))
+                    height = max(1, int(np.ceil((clip_ymax - clip_ymin) / res_y)))
+                    dst_transform = from_bounds(clip_xmin, clip_ymin, clip_xmax, clip_ymax, width, height)
+                    tif_extent = [clip_xmin, clip_xmax, clip_ymin, clip_ymax]
+                    tif_data = np.zeros((height, width), dtype=np.float32)
+                    reproject(
+                        source=rasterio.band(src, 1),
+                        destination=tif_data,
+                        src_transform=src.transform,
+                        src_crs=src.crs,
+                        dst_transform=dst_transform,
+                        dst_crs=dst_crs,
+                        resampling=Resampling.bilinear,
+                        src_nodata=src.nodata,
+                        dst_nodata=np.nan
+                    )
+                    tif_data = np.ma.masked_invalid(tif_data)
+                    tif_data = np.ma.masked_less_equal(tif_data, 0)
+
+                ax.imshow(
+                    tif_data,
+                    extent=tif_extent, # type: ignore
+                    origin="upper",
+                    cmap="Blues",
+                    alpha=0.6,
+                    zorder=1
+                )
+                
+                # DET Official Contour
+                det_shp_path = DET_SHP[rp]
+                raw_gdf = gpd.read_file(det_shp_path)
+                if raw_gdf.crs is not None and raw_gdf.crs.to_string() != "EPSG:4326":
+                    raw_gdf = raw_gdf.to_crs("EPSG:4326")
+                gdf_contour = _simplify_flood_contour(raw_gdf, clip_bounds=(clip_xmin, clip_ymin, clip_xmax, clip_ymax))
+                
+                gdf_contour.plot(
+                    ax=ax,
+                    facecolor="none",
+                    edgecolor="#8400DB",
+                    linewidth=1.3,
+                    linestyle="-",
+                    alpha=0.7,
+                    zorder=4
+                )
+                
+                # STO Contours
+                sto_tif_path_q05 = STO_TIF[rp]["Q05"]
+                sto_tif_path_q50 = STO_TIF[rp]["Q50"]
+                sto_tif_path_q95 = STO_TIF[rp]["Q95"]
+                bounds = (clip_xmin, clip_ymin, clip_xmax, clip_ymax)
+                gdf_sto_contour_q05 = _tif_to_simplified_shp(sto_tif_path_q05, clip_bounds=bounds)
+                gdf_sto_contour_q50 = _tif_to_simplified_shp(sto_tif_path_q50, clip_bounds=bounds)
+                gdf_sto_contour_q95 = _tif_to_simplified_shp(sto_tif_path_q95, clip_bounds=bounds)
+                gdf_sto_contour_q05.plot(
+                    ax=ax,
+                    facecolor="none",
+                    edgecolor="#003CFF",
+                    linewidth=1.3,
+                    linestyle=":",
+                    alpha=0.7,
+                    zorder=4
+                )
+                gdf_sto_contour_q50.plot(
+                    ax=ax,
+                    facecolor="none",
+                    edgecolor="#003CFF",
+                    linewidth=1.3,
+                    linestyle="-",
+                    alpha=0.7,
+                    zorder=4
+                )
+                gdf_sto_contour_q95.plot(
+                    ax=ax,
+                    facecolor="none",
+                    edgecolor="#003CFF",
+                    linewidth=1.3,
+                    linestyle="--",
+                    alpha=0.7,
+                    zorder=4
+                )
+        
+                # STYLE
+                plt.grid(True, linestyle="--", alpha=0.5)
+                ax.set_xlim(clip_xmin, clip_xmax)
+                ax.set_ylim(clip_ymin, clip_ymax)
+                ax.set_aspect("equal", adjustable="box")
+                
+                if not clean:
+                    title_str = (
+                        f"BID Centroids - Damage Map (RP {rp})"
+                        if rp is not None
+                        else "BID Centroids (WGS 84 / EPSG:4326)"
+                    )
+                    ax.set(
+                        xlabel="Longitude",
+                        ylabel="Latitude",
+                        title=title_str,
+                    )
+                    
+                    # Colorbar
+                    sm = cm.ScalarMappable(cmap=darkened_YlOrRd, norm=norm)
+                    sm.set_array([])
+                    cbar = fig.colorbar(sm, ax=ax)
+                    cbar_ticks = [vmin, vcenter, vmax]
+                    cbar.set_ticks(cbar_ticks)
+                    cbar.set_ticklabels([f"€10$^{{{t:.1f}}}$" for t in cbar_ticks])
+                    cbar.set_label("Damage Intensity (Log10 €)", rotation=270, labelpad=15)
+                    
+                    # Format labels
+                    ax.xaxis.set_major_formatter(FuncFormatter(_to_dms))
+                    ax.yaxis.set_major_formatter(FuncFormatter(_to_dms))
+                    
+                    # Graphic scale
+                    center_lat = (ymin + ymax) / 2.0
+                    dx_meters = 111_320 * np.cos(np.radians(center_lat))
+                    scalebar = ScaleBar(
+                        dx=dx_meters,
+                        units="m",
+                        dimension="si-length",
+                        location="lower left",  # 'lower left', 'lower right', 'upper left', etc.
+                        box_alpha=0.7,
+                        box_color="white",
+                        color="black",
+                        scale_loc="bottom",
+                        length_fraction=0.2,    # Scale bar will take ~20% of map width
+                    )
+                    ax.add_artist(scalebar)
+                    
+                else:
+                    ax.set(
+                        xticklabels=[],
+                        yticklabels=[],
+                    )
+                
+                # SAVE
+                base_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\postprocessor\damage\F6_DamageMap"
+                rp_suffix = f"_RP{rp}" if rp is not None else ""
+                clean_suffix = "_clean.png" if clean else ".png"
+                png_path = f"{base_path}{rp_suffix}{clean_suffix}"
+
+                _savefig(fig, png_path, clean, show)
+    damage_map_plot(gdf, (6.5, 2.9), clean = False, show = False)
+    damage_map_plot(gdf, (6.5, 2.9), clean = True, show = False)
+
+    # --- TOTAL DAMAGE DISTRIBUTION (Municipality STO) ---
+    # cost_Municipality_by_it
+    results.add_result(
+        res_name="cost_Municipality_by_it",
+        res_description="""Monte Carlo raw values at municipality level for each return period""",
+        data=(
+            results.collect_data(columns = ['it', 'RP', 'BID', 'FID', 'c_total'])
+            .group_by(["RP", "it"]) # type: ignore
+            .agg(pl.col("c_total").sum().alias("y"))
+            .select(["RP", "y"])
+        ),
+        overwrite=True,
+    )
+
+    # Plot
+    cost_Municipality_by_it = results.get_result_as_df(res_name = "cost_Municipality_by_it")
+    def damage_plot_0(data, figsize, clean: bool, show: bool):
+        # Unique Return Periods in order
+        return_periods = sorted(data["RP"].unique().to_list(), reverse=True)
+        
+        with plt.rc_context(custom_style): # type: ignore
+            for rp in return_periods:
+                # FIG
+                fig, ax = _init_fig(figsize, clean)
+                
+                # Extract damage values for current RP
+                y_data = data.filter(pl.col("RP") == rp)["y"].to_numpy()
+                
+                # Compute percentiles directly from empirical data
+                q05 = np.percentile(y_data, 5)
+                q50 = np.percentile(y_data, 50)
+                q95 = np.percentile(y_data, 95)
+                
+                # Fast Kernel Density Estimation for empirical violin shape
+                qlower, qupper = np.percentile(y_data, [0.1, 99.9])
+                y_clipped = y_data[(y_data >= qlower) & (y_data <= qupper)]
+                
+                def calculate_iqr_bandwidth(y_clipped):
+                    n = len(y_clipped)
+                    if n < 2:
+                        return 0.2
+                    q25, q75 = np.percentile(y_clipped, [25, 75])
+                    iqr = q75 - q25
+                    std_dev = np.std(y_clipped, ddof=1)
+                    
+                    # Robust standard deviation estimator using IQR
+                    sigma_robust = min(std_dev, iqr / 1.34) if iqr > 0 else std_dev
+                    
+                    # Silverman's bandwidth formula
+                    h = 0.9 * sigma_robust * (n ** (-1 / 5))
+                    
+                    # Convert h to bandwidth factor expected by scipy (h / std_dev)
+                    bw_factor = h / std_dev if std_dev > 0 else 0.2
+                    
+                    return bw_factor * 2
+                    
+                bw_factor = calculate_iqr_bandwidth(y_clipped)
+                kde = gaussian_kde(y_clipped, bw_method=bw_factor)
+                val_grid = np.linspace(qlower, qupper, 300)
+                pdf = kde(val_grid)
+                
+                # Normalize width
+                pdf_norm = (pdf / pdf.max()) * 0.38
+                x_center = 0
+                
+                # Fill density violin profile vertically
+                ax.fill_betweenx(
+                    val_grid,
+                    x_center - pdf_norm,
+                    x_center + pdf_norm,
+                    color=color_dic["RP"].get(rp),
+                    alpha=0.85,
+                    edgecolor='none'
+                )
+                
+                # Plot Horizontal Quantile Lines
+                ax.axhline(q95, color='black', linestyle='--', linewidth=1, label='0.95')
+                ax.axhline(q50, color='black', linestyle='-', linewidth=1, label='0.50')
+                ax.axhline(q05, color='black', linestyle=':', linewidth=1, label='0.05')
+                
+                # STYLE
+                ax.set(
+                    xticks=[x_center],
+                    xticklabels=[str(rp)],
+                    ylim=(q05 * 0.95, q95 * 1.05)
+                )
+                if not clean:
+                    ax.set(
+                        xlabel='Return Period',
+                        ylabel='Total (€)',
+                        title=f'Damage (€) - RP {rp}',
+                    )
+                else:
+                    ax.set(
+                        xticklabels=[],
+                        yticklabels=[]
+                    )
+                    ax.tick_params(axis='x', which='minor', bottom=False)
+                
+                # SAVE per Return Period
+                base_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\postprocessor\damage\F6_TotalDamage"
+                png_path = f"{base_path}_RP_{rp}"
+                png_path = png_path + f".png" if clean else png_path + f"_clean.png"
+                _savefig(fig, png_path, clean, show)
+                plt.close(fig)
+    damage_plot_0(cost_Municipality_by_it, (0.7, 1.8), clean = False, show = False)
+    damage_plot_0(cost_Municipality_by_it, (0.7, 1.8), clean = True, show = False)
+
+    # endregion
+
+    # ------------------------------
+    # region 2.3 DAMAGE EVOLUTION (Figure 7)
+    # ------------------------------
+    # --- HAZARD ---
+    # Plot
+    df_if_fit = results.get_result_as_df(res_name = "input_flow_fit")
+    def hazard_plot(figsize, clean:bool, show:bool):
+        # Get source
+        return_periods = df_if_fit["RP"].to_list()
+        skews = df_if_fit["Skew"].to_numpy()
+        locs = df_if_fit["Loc"].to_numpy()
+        scales = df_if_fit["Scale"].to_numpy()
+        
+        # X
+        x_pos = np.arange(len(return_periods))
+        
+        # Y
+        q05 = 10 ** pearson3.ppf(0.05, skew=skews, loc=locs, scale=scales)
+        q50 = 10 ** pearson3.ppf(0.50, skew=skews, loc=locs, scale=scales)
+        q95 = 10 ** pearson3.ppf(0.95, skew=skews, loc=locs, scale=scales)
+        
+        with plt.rc_context(custom_style): # type: ignore
+            # FIG
+            fig, ax = _init_fig(figsize, clean)
+            
+            # PLOT
+            for i, rp in enumerate(return_periods):
+                p_grid = np.linspace(0.01, 0.99, 300)
+                val_grid = 10 ** pearson3.ppf(p_grid, skew=skews[i], loc=locs[i], scale=scales[i])
+                
+                pdf_log = pearson3.pdf(np.log10(val_grid), skew=skews[i], loc=locs[i], scale=scales[i])
+                pdf_norm = (pdf_log / pdf_log.max()) * 0.38
+                
+                ax.fill_betweenx(
+                    val_grid,
+                    x_pos[i] - pdf_norm,
+                    x_pos[i] + pdf_norm,
+                    color=color_dic["RP"].get(rp),
+                    alpha=0.85,
+                    edgecolor='none'
+                )
+
+            ax.plot(x_pos, q95, color='black', linestyle='--', linewidth=1, label='0.95')
+            ax.plot(x_pos, q50, color='black', linestyle='-', linewidth=1, label='0.50')
+            ax.plot(x_pos, q05, color='black', linestyle=':', linewidth=1, label='0.05')
+            
+            # STYLE
+            ax.set(
+                xticks=x_pos,
+                xticklabels=return_periods,
+                ylim=(0, 10000)
+            )
+            if not clean:
+                ax.set(
+                    xlabel='Return Period',
+                    ylabel='Flow ($m^3/s$)',
+                    title='Hazard',
+                )
+            else:
+                ax.set(
+                    xticklabels=[],
+                    yticklabels=[]
+                )
+                ax.tick_params(axis='x', which='minor', bottom=False)
+            
+            # SAVE
+            png_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\postprocessor\damage\F5_Hazard"
+            png_path = png_path + f".png" if clean else png_path + f"_clean.png"
+            _savefig(fig, png_path, clean, show)
+    hazard_plot(figsize=(1.6, 3.4), clean=False, show=False)
+    hazard_plot(figsize=(1.6, 3.4), clean=True, show=False)
+
+    # --- DAMAGE (Total) ---
+    # Plot
+    cost_Municipality_by_it = results.get_result_as_df(res_name = "cost_Municipality_by_it")
+    def damage_plot_1(data, figsize, clean: bool, show: bool):
+        # Unique Return Periods in order
+        return_periods = sorted(data["RP"].unique().to_list(), reverse=True)
+        x_pos = np.arange(len(return_periods))
+        
+        with plt.rc_context(custom_style): # type: ignore
+            # FIG
+            fig, ax = _init_fig(figsize, clean)
+            
+            # PLOT
+            q05, q50, q95 = [], [], []
+            for i, rp in enumerate(return_periods):
+                # Extract damage values for current RP
+                y_data = data.filter(pl.col("RP") == rp)["y"].to_numpy()
+                
+                # Compute percentiles directly from empirical data
+                q05.append(np.percentile(y_data, 5))
+                q50.append(np.percentile(y_data, 50))
+                q95.append(np.percentile(y_data, 95))
+                
+                # Fast Kernel Density Estimation for empirical violin shape
+                qlower, qupper = np.percentile(y_data, [0.1, 99.9])
+                y_clipped = y_data[(y_data >= qlower) & (y_data <= qupper)]
+                def calculate_iqr_bandwidth(y_clipped):
+                    n = len(y_clipped)
+                    q25, q75 = np.percentile(y_clipped, [25, 75])
+                    iqr = q75 - q25
+                    std_dev = np.std(y_clipped, ddof=1)
+                    
+                    # Robust standard deviation estimator using IQR
+                    sigma_robust = min(std_dev, iqr / 1.34) if iqr > 0 else std_dev
+                    
+                    # Silverman's bandwidth formula
+                    h = 0.9 * sigma_robust * (n ** (-1 / 5))
+                    
+                    # Convert h to bandwidth factor expected by scipy (h / std_dev)
+                    bw_factor = h / std_dev if std_dev > 0 else 0.2
+                    
+                    return bw_factor * 3
+                bw_factor = calculate_iqr_bandwidth(y_clipped)
+                kde = gaussian_kde(y_clipped, bw_method=bw_factor)
+                val_grid = np.linspace(qlower, qupper, 300)
+                pdf = kde(val_grid)
+                
+                # Normalize width
+                pdf_norm = (pdf / pdf.max()) * 0.38
+                
+                # Fill density violin profile
+                ax.fill_betweenx(
+                    val_grid,
+                    x_pos[i] - pdf_norm,
+                    x_pos[i] + pdf_norm,
+                    color=color_dic["RP"].get(rp),
+                    alpha=0.85,
+                    edgecolor='none'
+                )
+
+            # Plot Quantile Lines
+            ax.plot(x_pos, q95, color='black', linestyle='--', linewidth=1, label='0.95')
+            ax.plot(x_pos, q50, color='black', linestyle='-', linewidth=1, label='0.50')
+            ax.plot(x_pos, q05, color='black', linestyle=':', linewidth=1, label='0.05')
+            
+            # STYLE
+            ax.set(
+                xticks=x_pos,
+                xticklabels=return_periods,
+                ylim=(0, max(q95) * 1.01)
+            )
+            if not clean:
+                ax.set(
+                    xlabel='Return Period',
+                    ylabel='Total (€)',
+                    title='Damage (€)',
+                )
+            else:
+                ax.set(
+                    xticklabels=[],
+                    yticklabels=[]
+                )
+                ax.tick_params(axis='x', which='minor', bottom=False)
+            
+            # SAVE
+            png_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\postprocessor\damage\F5_TotalDamage"
+            png_path = png_path + f".png" if clean else png_path + f"_clean.png"
+            _savefig(fig, png_path, clean, show)
+    damage_plot_1(cost_Municipality_by_it, figsize=(1.6, 1.6), clean=False, show=False)
+    damage_plot_1(cost_Municipality_by_it, figsize=(1.6, 1.6), clean=True, show=False)
+
+    # --- DAMAGE (By building) ---
+    # cost_by_BID_Municipality_by_it
+    results.add_result(
+        res_name="cost_by_BID_Municipality_by_it",
+        res_description="""Monte Carlo average (by BID) raw values at municipality for each return period""",
+        data=(
+            results.collect_data(columns = ['it', 'RP', 'BID', 'FID', 'c_total'])
+            .group_by(["RP", "it"]) # type: ignore
+            .agg((pl.col("c_total").sum() / pl.col("BID").n_unique()).alias("y"))
+            .select(["RP", "y"])
+        ),
+        overwrite=True,
+    )
+
+    # Plot
+    cost_by_BID_Municipality_by_it = results.get_result_as_df(res_name = "cost_by_BID_Municipality_by_it")
+    def damage_plot_2(data, figsize, clean: bool, show: bool):
+        # Unique Return Periods in order
+        return_periods = sorted(data["RP"].unique().to_list(), reverse=True)
+        x_pos = np.arange(len(return_periods))
+        
+        with plt.rc_context(custom_style): # type: ignore
+            # FIG
+            fig, ax = _init_fig(figsize, clean)
+            
+            # PLOT
+            q05, q50, q95 = [], [], []
+            for i, rp in enumerate(return_periods):
+                # Extract damage values for current RP
+                y_data = data.filter(pl.col("RP") == rp)["y"].to_numpy()
+                
+                # Compute percentiles directly from empirical data
+                q05.append(np.percentile(y_data, 5))
+                q50.append(np.percentile(y_data, 50))
+                q95.append(np.percentile(y_data, 95))
+                
+                # Fast Kernel Density Estimation for empirical violin shape
+                qlower, qupper = np.percentile(y_data, [0.5, 99.5])
+                y_clipped = y_data[(y_data >= qlower) & (y_data <= qupper)]
+                def calculate_iqr_bandwidth(y_clipped):
+                    n = len(y_clipped)
+                    q25, q75 = np.percentile(y_clipped, [25, 75])
+                    iqr = q75 - q25
+                    std_dev = np.std(y_clipped, ddof=1)
+                    
+                    # Robust standard deviation estimator using IQR
+                    sigma_robust = min(std_dev, iqr / 1.34) if iqr > 0 else std_dev
+                    
+                    # Silverman's bandwidth formula
+                    h = 0.9 * sigma_robust * (n ** (-1 / 5))
+                    
+                    # Convert h to bandwidth factor expected by scipy (h / std_dev)
+                    bw_factor = h / std_dev if std_dev > 0 else 0.2
+                    
+                    return bw_factor * 4
+                bw_factor = calculate_iqr_bandwidth(y_clipped)
+                kde = gaussian_kde(y_clipped, bw_method=bw_factor)
+                val_grid = np.linspace(qlower, qupper, 300)
+                pdf = kde(val_grid)
+                
+                # Normalize width
+                pdf_norm = (pdf / pdf.max()) * 0.38
+                
+                # Fill density violin profile
+                ax.fill_betweenx(
+                    val_grid,
+                    x_pos[i] - pdf_norm,
+                    x_pos[i] + pdf_norm,
+                    color=color_dic["RP"].get(rp),
+                    alpha=0.85,
+                    edgecolor='none'
+                )
+
+            # Plot Quantile Lines
+            ax.plot(x_pos, q95, color='black', linestyle='--', linewidth=1, label='0.95')
+            ax.plot(x_pos, q50, color='black', linestyle='-', linewidth=1, label='0.50')
+            ax.plot(x_pos, q05, color='black', linestyle=':', linewidth=1, label='0.05')
+            
+            # STYLE
+            ax.set(
+                xticks=x_pos,
+                xticklabels=return_periods,
+                ylim=(0, max(q95) * 1.5)
+            )
+            if not clean:
+                ax.set(
+                    xlabel='Return Period',
+                    ylabel='Total (€)',
+                    title='Damage (€)',
+                )
+            else:
+                ax.set(
+                    xticklabels=[],
+                    yticklabels=[]
+                )
+                ax.tick_params(axis='x', which='minor', bottom=False)
+            
+            # SAVE
+            png_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\postprocessor\damage\F5_ByBIDDamage"
+            png_path = png_path + f".png" if clean else png_path + f"_clean.png"
+            _savefig(fig, png_path, clean, show)
+    damage_plot_2(cost_by_BID_Municipality_by_it, figsize=(1.6, 1.6), clean=False, show=False)
+    damage_plot_2(cost_by_BID_Municipality_by_it, figsize=(1.6, 1.6), clean=True, show=False)
+
+    # --- Expected DAMAGE (Total) ---
+    # expected_cost_Municipality_by_it
+    results.add_result(
+        res_name="expected_cost_Municipality_by_it",
+        res_description="""Monte Carlo raw expected values at municipality level for each return period""",
+        data=(
+            results.collect_data(columns = ['it', 'RP', 'BID', 'FID', 'c_total'])
+            .group_by(["RP", "it"]) # type: ignore
+            .agg(pl.col("c_total").sum().alias("total_damage"))
+            .with_columns((pl.col("total_damage") / pl.col("RP")).alias("y"))
+            .select(["RP", "y"])
+        ),
+        overwrite=True,
+    )
+
+    # Plot
+    expected_cost_Municipality_by_it = results.get_result_as_df(res_name = "expected_cost_Municipality_by_it")
+    def damage_plot_3(data, figsize, clean: bool, show: bool):
+        # Unique Return Periods in order
+        return_periods = sorted(data["RP"].unique().to_list(), reverse=True)
+        x_pos = np.arange(len(return_periods))
+        
+        with plt.rc_context(custom_style): # type: ignore
+            # FIG
+            fig, ax = _init_fig(figsize, clean)
+            
+            # PLOT
+            q05, q50, q95 = [], [], []
+            for i, rp in enumerate(return_periods):
+                # Extract damage values for current RP
+                y_data = data.filter(pl.col("RP") == rp)["y"].to_numpy()
+                
+                # Compute percentiles directly from empirical data
+                q05.append(np.percentile(y_data, 5))
+                q50.append(np.percentile(y_data, 50))
+                q95.append(np.percentile(y_data, 95))
+                
+                # Fast Kernel Density Estimation for empirical violin shape
+                qlower, qupper = np.percentile(y_data, [0.5, 99.5])
+                y_clipped = y_data[(y_data >= qlower) & (y_data <= qupper)]
+                def calculate_iqr_bandwidth(y_clipped):
+                    n = len(y_clipped)
+                    q25, q75 = np.percentile(y_clipped, [25, 75])
+                    iqr = q75 - q25
+                    std_dev = np.std(y_clipped, ddof=1)
+                    
+                    # Robust standard deviation estimator using IQR
+                    sigma_robust = min(std_dev, iqr / 1.34) if iqr > 0 else std_dev
+                    
+                    # Silverman's bandwidth formula
+                    h = 0.9 * sigma_robust * (n ** (-1 / 5))
+                    
+                    # Convert h to bandwidth factor expected by scipy (h / std_dev)
+                    bw_factor = h / std_dev if std_dev > 0 else 0.2
+                    
+                    return bw_factor * 6
+                bw_factor = calculate_iqr_bandwidth(y_clipped)
+                kde = gaussian_kde(y_clipped, bw_method=bw_factor)
+                val_grid = np.linspace(qlower, qupper, 300)
+                pdf = kde(val_grid)
+                
+                # Normalize width
+                pdf_norm = (pdf / pdf.max()) * 0.38
+                
+                # Fill density violin profile
+                ax.fill_betweenx(
+                    val_grid,
+                    x_pos[i] - pdf_norm,
+                    x_pos[i] + pdf_norm,
+                    color=color_dic["RP"].get(rp),
+                    alpha=0.85,
+                    edgecolor='none'
+                )
+
+            # Plot Quantile Lines
+            ax.plot(x_pos, q95, color='black', linestyle='--', linewidth=1, label='0.95')
+            ax.plot(x_pos, q50, color='black', linestyle='-', linewidth=1, label='0.50')
+            ax.plot(x_pos, q05, color='black', linestyle=':', linewidth=1, label='0.05')
+            
+            # STYLE
+            ax.set(
+                xticks=x_pos,
+                xticklabels=return_periods,
+                ylim=(0, max(q95) * 1.5)
+            )
+            if not clean:
+                ax.set(
+                    xlabel='Return Period',
+                    ylabel='Total (€)',
+                    title='Damage (€)',
+                )
+            else:
+                ax.set(
+                    xticklabels=[],
+                    yticklabels=[]
+                )
+                ax.tick_params(axis='x', which='minor', bottom=False)
+            
+            # SAVE
+            png_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\postprocessor\damage\F5_ExpectedDamage"
+            png_path = png_path + f".png" if clean else png_path + f"_clean.png"
+            _savefig(fig, png_path, clean, show)
+    damage_plot_3(expected_cost_Municipality_by_it, figsize=(1.6, 1.6), clean=False, show=False)
+    damage_plot_3(expected_cost_Municipality_by_it, figsize=(1.6, 1.6), clean=True, show=False)
+
+    # --- Expected DAMAGE (By BID) ---
+    # expected_cost_by_BID_Municipality_by_it
+    results.add_result(
+        res_name="expected_cost_by_BID_Municipality_by_it",
+        res_description="""Monte Carlo expected average (by BID) raw values at municipality for each return period""",
+        data=(
+            results.collect_data(columns = ['it', 'RP', 'BID', 'FID', 'c_total'])
+            .group_by(["RP", "it"]) # type: ignore
+            .agg((pl.col("c_total").sum() / pl.col("BID").n_unique()).alias("total_average_damage"))
+            .with_columns((pl.col("total_average_damage") / pl.col("RP")).alias("y"))
+            .select(["RP", "y"])
+        ),
+        overwrite=True,
+    )
+
+    # Plot
+    expected_cost_by_BID_Municipality_by_it = results.get_result_as_df(res_name = "expected_cost_by_BID_Municipality_by_it")
+    def damage_plot_4(data, figsize, clean: bool, show: bool):
+        # Unique Return Periods in order
+        return_periods = sorted(data["RP"].unique().to_list(), reverse=True)
+        x_pos = np.arange(len(return_periods))
+        
+        with plt.rc_context(custom_style): # type: ignore
+            # FIG
+            fig, ax = _init_fig(figsize, clean)
+            
+            # PLOT
+            q05, q50, q95 = [], [], []
+            for i, rp in enumerate(return_periods):
+                # Extract damage values for current RP
+                y_data = data.filter(pl.col("RP") == rp)["y"].to_numpy()
+                
+                # Compute percentiles directly from empirical data
+                q05.append(np.percentile(y_data, 5))
+                q50.append(np.percentile(y_data, 50))
+                q95.append(np.percentile(y_data, 95))
+                
+                # Fast Kernel Density Estimation for empirical violin shape
+                qlower, qupper = np.percentile(y_data, [0.5, 99.5])
+                y_clipped = y_data[(y_data >= qlower) & (y_data <= qupper)]
+                def calculate_iqr_bandwidth(y_clipped):
+                    n = len(y_clipped)
+                    q25, q75 = np.percentile(y_clipped, [25, 75])
+                    iqr = q75 - q25
+                    std_dev = np.std(y_clipped, ddof=1)
+                    
+                    # Robust standard deviation estimator using IQR
+                    sigma_robust = min(std_dev, iqr / 1.34) if iqr > 0 else std_dev
+                    
+                    # Silverman's bandwidth formula
+                    h = 0.9 * sigma_robust * (n ** (-1 / 5))
+                    
+                    # Convert h to bandwidth factor expected by scipy (h / std_dev)
+                    bw_factor = h / std_dev if std_dev > 0 else 0.2
+                    
+                    return bw_factor * 6
+                bw_factor = calculate_iqr_bandwidth(y_clipped)
+                kde = gaussian_kde(y_clipped, bw_method=bw_factor)
+                val_grid = np.linspace(qlower, qupper, 300)
+                pdf = kde(val_grid)
+                
+                # Normalize width
+                pdf_norm = (pdf / pdf.max()) * 0.38
+                
+                # Fill density violin profile
+                ax.fill_betweenx(
+                    val_grid,
+                    x_pos[i] - pdf_norm,
+                    x_pos[i] + pdf_norm,
+                    color=color_dic["RP"].get(rp),
+                    alpha=0.85,
+                    edgecolor='none'
+                )
+
+            # Plot Quantile Lines
+            ax.plot(x_pos, q95, color='black', linestyle='--', linewidth=1, label='0.95')
+            ax.plot(x_pos, q50, color='black', linestyle='-', linewidth=1, label='0.50')
+            ax.plot(x_pos, q05, color='black', linestyle=':', linewidth=1, label='0.05')
+            
+            # STYLE
+            ax.set(
+                xticks=x_pos,
+                xticklabels=return_periods,
+                ylim=(0, max(q95) * 1.5)
+            )
+            if not clean:
+                ax.set(
+                    xlabel='Return Period',
+                    ylabel='Total (€)',
+                    title='Damage (€)',
+                )
+            else:
+                ax.set(
+                    xticklabels=[],
+                    yticklabels=[]
+                )
+                ax.tick_params(axis='x', which='minor', bottom=False)
+            
+            # SAVE
+            png_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\postprocessor\damage\F5_ExpectedByBIDDamage"
+            png_path = png_path + f".png" if clean else png_path + f"_clean.png"
+            _savefig(fig, png_path, clean, show)
+    damage_plot_4(expected_cost_by_BID_Municipality_by_it, figsize=(1.6, 1.6), clean=False, show=False)
+    damage_plot_4(expected_cost_by_BID_Municipality_by_it, figsize=(1.6, 1.6), clean=True, show=False)
+
+    # --- Expected Annual DAMAGE (EAD Total) ---
+    # expected_annual_damage_Municipality
+    results.add_result(
+        res_name="expected_annual_damage_Municipality",
+        res_description="""Monte Carlo expected annual damage at municipality for each return period""",
+        data=(
+            results.collect_data(columns=['it', 'RP', 'BID', 'FID', 'c_total'])
+            .group_by(["RP", "it"]) # type: ignore
+            .agg(pl.col("c_total").sum().alias("total_damage"))
+            .group_by("RP")
+            .agg([
+                pl.col("total_damage").quantile(0.05).alias("q05_damage"),
+                pl.col("total_damage").mean().alias("q50_damage"),
+                pl.col("total_damage").quantile(0.95).alias("q95_damage"),
+            ])
+            .extend(
+                pl.DataFrame(
+                    {
+                        "RP": [2],
+                        "q05_damage": [0.0],
+                        "q50_damage": [0.0],
+                        "q95_damage": [0.0],
+                    }
+                )
+            )
+            .sort("RP")
+            .with_columns(p=1 / pl.col("RP"))
+            .select(
+                [
+                    (
+                        (pl.col(col) + pl.col(col).shift(-1))
+                        / 2
+                        * (pl.col("p") - pl.col("p").shift(-1))
+                    )
+                    .sum()
+                    .alias(f"ead_{col}")
+                    for col in ["q05_damage", "q50_damage", "q95_damage"]
+                ]
+            )
+        ),
+        overwrite=True,
+    )
+    expected_annual_damage_Municipality = results.get_result_as_df(res_name = "expected_annual_damage_Municipality")
+
+    # --- Expected Annual DAMAGE (EAD by BID) ---
+    # expected_annual_damage_by_BID_Municipality
+    results.add_result(
+        res_name="expected_annual_damage_by_BID_Municipality",
+        res_description="""Monte Carlo expected annual damage at municipality (by BID) for each return period""",
+        data=(
+            results.collect_data(columns=['it', 'RP', 'BID', 'FID', 'c_total'])
+            .group_by(["RP", "it"]) # type: ignore
+            .agg((pl.col("c_total").sum() / pl.col("BID").n_unique()).alias("total_damage"))
+            .group_by("RP")
+            .agg([
+                pl.col("total_damage").quantile(0.05).alias("q05_damage"),
+                pl.col("total_damage").mean().alias("q50_damage"),
+                pl.col("total_damage").quantile(0.95).alias("q95_damage"),
+            ])
+            .extend(
+                pl.DataFrame(
+                    {
+                        "RP": [2],
+                        "q05_damage": [0.0],
+                        "q50_damage": [0.0],
+                        "q95_damage": [0.0],
+                    }
+                )
+            )
+            .sort("RP")
+            .with_columns(p=1 / pl.col("RP"))
+            .select(
+                [
+                    (
+                        (pl.col(col) + pl.col(col).shift(-1))
+                        / 2
+                        * (pl.col("p") - pl.col("p").shift(-1))
+                    )
+                    .sum()
+                    .alias(f"ead_{col}")
+                    for col in ["q05_damage", "q50_damage", "q95_damage"]
+                ]
+            )
+        ),
+        overwrite=True,
+    )
+    expected_annual_damage_by_BID_Municipality = results.get_result_as_df(res_name = "expected_annual_damage_by_BID_Municipality")
+
+    # endregion
+
+    # ------------------------------
+    # region 2.4 DAMAGE FUNCTION (Figure 8)
+    # ------------------------------
+    # --- % of Total Damage (up to first floor) ---
+    # pct_hi_damage_up_to_first_floor
+    results.add_result(
+        res_name="pct_hi_damage_up_to_first_floor",
+        res_description="""Estimated depth curve from model for first floor and bassement
+        if exist considering internal water depth at first floor""",
+        data=(
+            results.collect_data(columns=['it', 'RP', 'BID', 'FID', 'hi', 'c_total', 'cM_total'])
+            .filter(pl.col("FID").is_in([-1, 0])) # type: ignore [-1, 0]
+            .group_by(["it", 'RP', "BID"])
+            .agg([
+                pl.col("c_total").sum().alias("c_sum"),
+                pl.col("cM_total").sum().alias("cM_sum"),
+                pl.col("hi").filter(pl.col("FID") == 0).first().alias("hi"),
+            ])
+            .with_columns(
+                pl.when(pl.col("cM_sum") > 0)
+                .then(pl.col("c_sum") / pl.col("cM_sum"))
+                .otherwise(0.0)
+                .alias("damage_pct")
+            )
+            .with_columns(
+                ((pl.col("hi") / 0.1).floor() * 0.1 + 0.05).round(2).alias("hi_bin")
+            )
+            .group_by("hi_bin")
+            .agg([
+                pl.col("damage_pct").quantile(0.05).alias("q05_damage"),
+                pl.col("damage_pct").quantile(0.50).alias("q50_damage"),
+                pl.col("damage_pct").quantile(0.95).alias("q95_damage"),
+            ])
+            .vstack(
+                pl.DataFrame({
+                    "hi_bin": [0.0],
+                    "q05_damage": [0.0],
+                    "q50_damage": [0.0],
+                    "q95_damage": [0.0],
+                })
+            )
+            .sort("hi_bin")
+        ),
+        overwrite=True,
+    )
+
+    # Plot
+    pct_hi_damage_up_to_first_floor = results.get_result_as_df(res_name = "pct_hi_damage_up_to_first_floor")
+    def depth_damage_plot_1(data, figsize, clean: bool, show: bool):
+        # Extract data series from Polars DataFrame
+        x = data["hi_bin"].to_numpy()
+        q05 = data["q05_damage"].to_numpy()
+        q50 = data["q50_damage"].to_numpy()
+        q95 = data["q95_damage"].to_numpy()
+        
+        with plt.rc_context(custom_style): # type: ignore
+            # FIG
+            fig, ax = _init_fig(figsize, clean)
+            
+            # PLOT
+            # Fill standard 5th to 95th quantile interval
+            ax.fill_between(
+                x, 
+                q05, 
+                q95, 
+                color='#C0C0C0', 
+                alpha=0.7, 
+                edgecolor='none'
+            )
+            
+            # Plot Median (q50) line
+            ax.plot(
+                x, 
+                q50, 
+                color='black', 
+                linewidth=1.2, 
+                linestyle='-'
+            )
+            
+            # GRID & AXIS SETUP
+            ax.grid(True, linestyle='--', linewidth=0.5, color='lightgray', alpha=0.8)
+            ax.set_axisbelow(True)
+            ax.set_ylim(0.0, 1.0)
+            ax.set_xlim(0, max(x))
+            
+            # STYLE
+            if not clean:
+                ax.set(
+                    xlabel='Water depth (m)',
+                    ylabel='Total damage, First floor',
+                )
+                ax.text(
+                    0.02, 0.95, '(a)', 
+                    transform=ax.transAxes, 
+                    fontsize=10, 
+                    fontweight='bold', 
+                    va='top'
+                )
+            else:
+                ax.set(
+                    xticklabels=[],
+                    yticklabels=[]
+                )
+                ax.tick_params(axis='x', which='minor', bottom=False)
+            
+            # SAVE
+            png_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\postprocessor\damage\F5_DamageCurve"
+            png_path = png_path + f".png" if not clean else png_path + f"_clean.png"
+            _savefig(fig, png_path, clean, show)
+    depth_damage_plot_1(pct_hi_damage_up_to_first_floor, figsize=(2.3, 1.2), clean=False, show=False)
+    depth_damage_plot_1(pct_hi_damage_up_to_first_floor, figsize=(2.3, 1.2), clean=True, show=False)
+
+    # --- % of Total Damage (all building) ---
+    # pct_he_damage_all_building
+    results.add_result(
+        res_name="pct_he_damage_all_building",
+        res_description="""Estimated depth curve from model for all building using external water depth""",
+        data=(
+            results.collect_data(columns=['it', 'RP', 'BID', 'FID', 'he', 'c_total', 'cM_total'])
+            .group_by(["it", 'RP', "BID"]) # type: ignore
+            .agg([
+                pl.col("c_total").sum().alias("c_sum"),
+                pl.col("cM_total").sum().alias("cM_sum"),
+                pl.col("he").first().alias("he"),
+            ])
+            .with_columns(
+                pl.when(pl.col("cM_sum") > 0)
+                .then(pl.col("c_sum") / pl.col("cM_sum"))
+                .otherwise(0.0)
+                .alias("damage_pct")
+            )
+            .with_columns(
+                pl.when(pl.col("he") < 0.2)
+                .then(((pl.col("he") / 0.1).floor() * 0.1 + 0.05).round(2))
+                .when(pl.col("he") < 0.6)
+                .then(((pl.col("he") / 0.2).floor() * 0.2 + 0.1).round(2))
+                .when(pl.col("he") < 1.2)
+                .then(((pl.col("he") / 0.3).floor() * 0.3 + 0.15).round(2))
+                .when(pl.col("he") < 2)
+                .then(((pl.col("he") / 0.4).floor() * 0.4 + 0.2).round(2))
+                .otherwise(((pl.col("he") / 0.5).floor() * 0.5 + 0.25).round(2))
+                .alias("he_bin")
+            )
+            .group_by("he_bin")
+            .agg([
+                pl.col("damage_pct").quantile(0.05).alias("q05_damage"),
+                pl.col("damage_pct").quantile(0.50).alias("q50_damage"),
+                pl.col("damage_pct").quantile(0.95).alias("q95_damage"),
+            ])
+            .vstack(
+                pl.DataFrame({
+                    "he_bin": [0.0],
+                    "q05_damage": [0.0],
+                    "q50_damage": [0.0],
+                    "q95_damage": [0.0],
+                })
+            )
+            .sort("he_bin")
+        ),
+        overwrite=True,
+    )
+
+    # Plot
+    pct_he_damage_all_building = results.get_result_as_df(res_name = "pct_he_damage_all_building")
+    def depth_damage_plot_2(data, figsize, clean: bool, show: bool):
+        # Extract data series from Polars DataFrame
+        x = data["he_bin"].to_numpy()
+        q05 = data["q05_damage"].to_numpy()
+        q50 = data["q50_damage"].to_numpy()
+        q95 = data["q95_damage"].to_numpy()
+        
+        with plt.rc_context(custom_style): # type: ignore
+            # FIG
+            fig, ax = _init_fig(figsize, clean)
+            
+            # PLOT
+            # Fill standard 5th to 95th quantile interval
+            ax.fill_between(
+                x, 
+                q05, 
+                q95, 
+                color='#C0C0C0', 
+                alpha=0.7, 
+                edgecolor='none'
+            )
+            
+            # Plot Median (q50) line
+            ax.plot(
+                x, 
+                q50, 
+                color='black', 
+                linewidth=1.2, 
+                linestyle='-'
+            )
+            
+            # GRID & AXIS SETUP
+            ax.grid(True, linestyle='--', linewidth=0.5, color='lightgray', alpha=0.8)
+            ax.set_axisbelow(True)
+            ax.set_ylim(0.0, 1.0)
+            ax.set_xlim(0, max(x))
+            
+            # STYLE
+            if not clean:
+                ax.set(
+                    xlabel='Water depth (m)',
+                    ylabel='Total damage, First floor',
+                )
+                ax.text(
+                    0.02, 0.95, '(a)', 
+                    transform=ax.transAxes, 
+                    fontsize=10, 
+                    fontweight='bold', 
+                    va='top'
+                )
+            else:
+                ax.set(
+                    xticklabels=[],
+                    yticklabels=[]
+                )
+                ax.tick_params(axis='x', which='minor', bottom=False)
+            
+            # SAVE
+            png_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\postprocessor\damage\F5_DamageCurveAll"
+            png_path = png_path + f".png" if not clean else png_path + f"_clean.png"
+            _savefig(fig, png_path, clean, show)
+    depth_damage_plot_2(pct_he_damage_all_building, figsize=(2.3, 1.2), clean=False, show=False)
+    depth_damage_plot_2(pct_he_damage_all_building, figsize=(2.3, 1.2), clean=True, show=False)
+
+    # --- % of Total Damage (up to first floor, content and continent) ---
+    # pct_hi_damage_up_to_first_floor_cte_cti
+    results.add_result(
+        res_name="pct_hi_damage_up_to_first_floor_cte_cti",
+        res_description="""Estimated depth curve from model for all building using external water depth""",
+        data=(
+            results.collect_data(columns=['it', 'RP', 'BID', 'FID', 'hi', 'c_CTEs', 'c_CTIs', 'cM_CTEs', 'cM_CTIs'])
+            .filter(pl.col("FID").is_in([-1, 0])) # type: ignore
+            .group_by(["it", 'RP', "BID"])
+            .agg([
+                pl.col("c_CTEs").sum().alias("c_sum_CTE"),
+                pl.col("cM_CTEs").sum().alias("cM_sum_CTE"),
+                pl.col("c_CTIs").sum().alias("c_sum_CTI"),
+                pl.col("cM_CTIs").sum().alias("cM_sum_CTI"),
+                pl.col("hi").filter(pl.col("FID") == 0).first().alias("hi"),
+            ])
+            .with_columns(
+                pl.when(pl.col("cM_sum_CTE") > 0)
+                .then(pl.col("c_sum_CTE") / pl.col("cM_sum_CTE"))
+                .otherwise(0.0)
+                .alias("damage_pct_CTE"),
+                
+                pl.when(pl.col("cM_sum_CTI") > 0)
+                .then(pl.col("c_sum_CTI") / pl.col("cM_sum_CTI"))
+                .otherwise(0.0)
+                .alias("damage_pct_CTI"),
+            )
+            .with_columns(
+                ((pl.col("hi") / 0.1).floor() * 0.1 + 0.05).round(2).alias("hi_bin")
+            )
+            .group_by("hi_bin")
+            .agg([
+                # CTE Quantiles
+                pl.col("damage_pct_CTE").quantile(0.05).alias("q05_damage_CTE"),
+                pl.col("damage_pct_CTE").quantile(0.50).alias("q50_damage_CTE"),
+                pl.col("damage_pct_CTE").quantile(0.95).alias("q95_damage_CTE"),
+                # CTI Quantiles
+                pl.col("damage_pct_CTI").quantile(0.05).alias("q05_damage_CTI"),
+                pl.col("damage_pct_CTI").quantile(0.50).alias("q50_damage_CTI"),
+                pl.col("damage_pct_CTI").quantile(0.95).alias("q95_damage_CTI"),
+            ])
+            .vstack(
+                pl.DataFrame({
+                    "hi_bin": [0.0],
+                    "q05_damage_CTE": [0.0],
+                    "q50_damage_CTE": [0.0],
+                    "q95_damage_CTE": [0.0],
+                    "q05_damage_CTI": [0.0],
+                    "q50_damage_CTI": [0.0],
+                    "q95_damage_CTI": [0.0],
+                })
+            )
+            .sort("hi_bin")
+        ),
+        overwrite=True,
+    )
+
+    # Plot
+    pct_hi_damage_up_to_first_floor_cte_cti = results.get_result_as_df(res_name = "pct_hi_damage_up_to_first_floor_cte_cti")
+    def depth_damage_plot_3(data, figsize, clean: bool, show: bool):
+        # Extract data series from Polars DataFrame (using hi_bin as x)
+        x = data["hi_bin"].to_numpy()
+        
+        # CTE series
+        q05_cte = data["q05_damage_CTE"].to_numpy()
+        q50_cte = data["q50_damage_CTE"].to_numpy()
+        q95_cte = data["q95_damage_CTE"].to_numpy()
+        
+        # CTI series
+        q05_cti = data["q05_damage_CTI"].to_numpy()
+        q50_cti = data["q50_damage_CTI"].to_numpy()
+        q95_cti = data["q95_damage_CTI"].to_numpy()
+        
+        with plt.rc_context(custom_style): # type: ignore
+            # FIG
+            fig, ax = _init_fig(figsize, clean)
+            
+            # PLOT CTE
+            ax.fill_between(
+                x, 
+                q05_cte, 
+                q95_cte, 
+                color='#1f77b4', 
+                alpha=0.25, 
+                edgecolor='none',
+                label='CTE 5-95%'
+            )
+            ax.plot(
+                x, 
+                q50_cte, 
+                color='#1f77b4', 
+                linewidth=1.2, 
+                linestyle='-',
+                label='CTE Median'
+            )
+            
+            # PLOT CTI
+            ax.fill_between(
+                x, 
+                q05_cti, 
+                q95_cti, 
+                color='#ff7f0e', 
+                alpha=0.25, 
+                edgecolor='none',
+                label='CTI 5-95%'
+            )
+            ax.plot(
+                x, 
+                q50_cti, 
+                color='#ff7f0e', 
+                linewidth=1.2, 
+                linestyle='--',
+                label='CTI Median'
+            )
+            
+            # GRID & AXIS SETUP
+            ax.grid(True, linestyle='--', linewidth=0.5, color='lightgray', alpha=0.8)
+            ax.set_axisbelow(True)
+            ax.set_ylim(0.0, 1.0)
+            ax.set_xlim(0, max(x))
+            
+            # STYLE
+            if not clean:
+                ax.set(
+                    xlabel='Water depth (m)',
+                    ylabel='Total damage, First floor',
+                )
+                ax.text(
+                    0.02, 0.95, '(a)', 
+                    transform=ax.transAxes, 
+                    fontsize=10, 
+                    fontweight='bold', 
+                    va='top'
+                )
+                ax.legend(fontsize=6, loc='lower right', frameon=False)
+            else:
+                ax.set(
+                    xticklabels=[],
+                    yticklabels=[]
+                )
+                ax.tick_params(axis='x', which='minor', bottom=False)
+            
+            # SAVE
+            png_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\postprocessor\damage\F5_DamageCurve_CTE_CTI"
+            png_path = png_path + f".png" if not clean else png_path + f"_clean.png"
+            _savefig(fig, png_path, clean, show)
+    depth_damage_plot_3(pct_hi_damage_up_to_first_floor_cte_cti, figsize=(3.2, 2.7), clean=False, show=False)
+    depth_damage_plot_3(pct_hi_damage_up_to_first_floor_cte_cti, figsize=(3.2, 2.7), clean=True, show=False)
+
+    # endregion
+
+    # ------------------------------
+    # region 2.5 EAD (Figure 9)
+    # ------------------------------
+    # --- EAD (Map) ---
+    # expected_annual_damage_by_BID
+    results.add_result(
+        res_name="expected_annual_damage_by_BID",
+        res_description="""Monte Carlo expected average (by BID) with quantiles""",
+        data=(
+            results.collect_data(columns = ['it', 'RP', 'BID', 'FID', 'c_total'])
+            .group_by(["RP", "it", "BID"]) # type: ignore
+            .agg((pl.col("c_total").sum()).alias("c_sum"))
+            .group_by(["RP", "BID"])
+            .agg([
+                pl.col("c_sum").quantile(0.05).alias("q05_c_sum"),
+                pl.col("c_sum").quantile(0.50).alias("q50_c_sum"),
+                pl.col("c_sum").quantile(0.95).alias("q95_c_sum"),
+            ])
+            .pipe(
+                lambda df: pl.concat([
+                    df.select("BID")
+                    .unique()
+                    .with_columns(
+                        pl.lit(2).cast(pl.Int64).alias("RP"),
+                        pl.lit(0.0).alias("q05_c_sum"),
+                        pl.lit(0.0).alias("q50_c_sum"),
+                        pl.lit(0.0).alias("q95_c_sum"),
+                    )
+                    .select(df.columns),
+                    df.filter(pl.col("RP") != 2),
+                ])
+            )
+            .with_columns((1 / pl.col("RP")).alias("p"))
+            .sort(["BID", "RP"])
+            .group_by("BID")
+            .agg([
+                (
+                    0.5 * (pl.col(c) + pl.col(c).shift(-1)) * 
+                    (pl.col("p") - pl.col("p").shift(-1))
+                ).sum().alias(f"ead_{c}")
+                for c in ["q05_c_sum", "q50_c_sum", "q95_c_sum"]
+            ])
+            .sort("BID")
+        ),
+        overwrite=True,
+    )
+
+    # Data
+    expected_annual_damage_by_BID = results.get_result_as_df(res_name = "expected_annual_damage_by_BID")
+    expected_annual_damage_by_BID_pandas = expected_annual_damage_by_BID.to_pandas()
+    ead_gdf = raw_gdf.merge(
+        expected_annual_damage_by_BID_pandas,
+        on="BID",
+        how="inner"
+    )
+
+
+    def _get_highlight_mask(df, highlight):
+        """Helper function to create a combined boolean mask from a highlight dict.
+        Handles both GeoDataFrame/Pandas and Polars DataFrames.
+        """
+        if not highlight:
+            return None
+
+        is_polars = isinstance(df, pl.DataFrame)
+        mask = None
+
+        for op, conds in highlight.items():
+            for col, val in conds.items():
+                if is_polars:
+                    if op == ">":
+                        curr = df[col] > val
+                    elif op == ">=":
+                        curr = df[col] >= val
+                    elif op == "<":
+                        curr = df[col] < val
+                    elif op == "<=":
+                        curr = df[col] <= val
+                    elif op == "==":
+                        curr = df[col] == val
+                    else:
+                        continue
+                else:  # Pandas / GeoPandas
+                    if op == ">":
+                        curr = df[col] > val
+                    elif op == ">=":
+                        curr = df[col] >= val
+                    elif op == "<":
+                        curr = df[col] < val
+                    elif op == "<=":
+                        curr = df[col] <= val
+                    elif op == "==":
+                        curr = df[col] == val
+                    else:
+                        continue
+
+                mask = curr if mask is None else (mask & curr)
+
+        return mask
+    hig = {">": {"ead_q50_c_sum": 2700}, "<": {"NEAR_DIST": 200}}
+
+    # Plot
+    def ead_map_plot(gdf_data, figsize, clean: bool, show: bool, highlight: dict | None = None):
+        # WMS request
+        wms_url = "https://www.ign.es/wms-inspire/pnoa-ma?request=GetCapabilities&service=WMS"
+        wms = WebMapService(wms_url, version="1.1.1")
+        xmin, ymin, xmax, ymax = gdf_data.total_bounds
+        x_pad = (xmax - xmin) * 0.05 if xmax != xmin else 0.01
+        y_pad = (ymax - ymin) * 0.05 if ymax != ymin else 0.01
+        xmin, xmax = xmin - x_pad, xmax + x_pad
+        ymin, ymax = ymin - y_pad, ymax + y_pad
+        extent = [xmin, xmax, ymin, ymax]
+        bbox = (extent[0], extent[2], extent[1], extent[3])
+        img_request = wms.getmap(
+            layers=["OI.OrthoimageCoverage"],
+            srs="EPSG:4326",
+            bbox=bbox,
+            size=(1000, 1000),
+            format="image/png",
+            transparent=True
+        )
+        img_data = mpimg.imread(BytesIO(img_request.read()))
+        
+        #base_cmap = plt.get_cmap("YlOrRd")
+        #colors = base_cmap(np.linspace(0, 1, 256)) ** 2.1
+        #darkened_YlOrRd = mcolors.LinearSegmentedColormap.from_list("DarkYlOrRd", colors)
+        
+        clip_xmin, clip_ymin, clip_xmax, clip_ymax = gdf_data.total_bounds
+        print(clip_xmin, clip_ymin, clip_xmax, clip_ymax)
+        chart_style = {
+            **custom_style,
+            "xtick.top": True,
+            "xtick.bottom": False,
+            "xtick.labeltop": True,
+            "xtick.labelbottom": False,
+        }
+        with plt.rc_context(chart_style):  # type: ignore
+            # FIG
+            fig, ax = _init_fig(figsize, clean)
+            
+            # Filter data
+            col = f"ead_q50_c_sum"
+            gdf_zero = gdf_data[gdf_data[col] == 0]
+            gdf_pos = gdf_data[gdf_data[col] > 0].copy()
+            #gdf_pos["q50_log"] = np.log10(gdf_pos[rp_col])
+
+            # PLOT
+            # SHP (EAD)
+            q50_pos = gdf_pos[col].to_numpy()
+            vmin = float(np.percentile(q50_pos, 5))
+            vcenter = float(np.percentile(q50_pos, 50))
+            vmax = float(np.percentile(q50_pos, 95))
+            if vmin >= vcenter:
+                vmin = vcenter - 0.1
+            if vmax <= vcenter:
+                vmax = vcenter + 0.1
+            norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=vcenter, vmax=vmax)
+            
+            if not gdf_zero.empty:
+                gdf_zero.plot(
+                    ax=ax,
+                    color="white",
+                    edgecolor="none",
+                    linewidth=0,
+                    markersize=6,
+                    zorder=2,
+                )
+                
+            if not gdf_pos.empty:
+                gdf_pos.plot(
+                    column=col,
+                    cmap="YlOrRd",
+                    norm=norm,
+                    markersize=9,
+                    legend=False,
+                    ax=ax,
+                    edgecolor="none",
+                    linewidth=0,
+                    zorder=3,
+                )
+            
+            # HIGHLIGHT CONTOUR LAYER
+            hl_mask = _get_highlight_mask(gdf_data, highlight)
+            if hl_mask is not None and hl_mask.any():
+                gdf_highlight = gdf_data[hl_mask]
+                gdf_highlight.plot(
+                    ax=ax,
+                    facecolor="none",
+                    edgecolor="blue",
+                    linewidth=1.5,
+                    markersize=12,
+                    zorder=4,
+                )
+            
+            # WMS
+            ax.imshow(
+                img_data, 
+                extent=extent, # type: ignore
+                origin="upper", 
+                alpha=1.0, 
+                zorder=0
+            )
+            
+            # STYLE
+            plt.grid(True, linestyle="--", alpha=0.5)
+            ax.set_xlim(clip_xmin, clip_xmax)
+            ax.set_ylim(clip_ymin, clip_ymax)
+            ax.set_aspect("equal", adjustable="box")
+            
+            if not clean:
+                ax.set(
+                    xlabel="Longitude",
+                    ylabel="Latitude",
+                    title="BID Centroids EAD (WGS 84 / EPSG:4326)",
+                )
+                
+                # Format labels
+                ax.xaxis.set_major_formatter(FuncFormatter(_to_dms))
+                ax.yaxis.set_major_formatter(FuncFormatter(_to_dms))
+                
+                # Colorbar
+                sm = cm.ScalarMappable(cmap="YlOrRd", norm=norm)
+                sm.set_array([])
+                cbar = fig.colorbar(sm, ax=ax)
+                cbar_ticks = [vmin, vcenter, vmax]
+                print(cbar_ticks)
+                cbar.set_ticks(cbar_ticks)
+                cbar.set_ticklabels([f"€{t:.1f}$" for t in cbar_ticks])
+                cbar.set_label("Damage Intensity (€)", rotation=270, labelpad=15)
+                
+                # Format labels
+                ax.xaxis.set_major_formatter(FuncFormatter(_to_dms))
+                ax.yaxis.set_major_formatter(FuncFormatter(_to_dms))
+                
+                # Graphic scale
+                center_lat = (ymin + ymax) / 2.0
+                dx_meters = 111_320 * np.cos(np.radians(center_lat))
+                scalebar = ScaleBar(
+                    dx=dx_meters,
+                    units="m",
+                    dimension="si-length",
+                    location="lower left",  # 'lower left', 'lower right', 'upper left', etc.
+                    box_alpha=0.7,
+                    box_color="white",
+                    color="black",
+                    scale_loc="bottom",
+                    length_fraction=0.2,    # Scale bar will take ~20% of map width
+                )
+                ax.add_artist(scalebar)
+                
+                
+            else:
+                ax.set(
+                    xticklabels=[],
+                    yticklabels=[],
+                )
+            
+            # SAVE
+            base_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\postprocessor\damage\F9_EADMap"
+            clean_suffix = "_clean.png" if clean else ".png"
+            png_path = f"{base_path}{clean_suffix}"
+
+            _savefig(fig, png_path, clean, show)
+    ead_map_plot(ead_gdf, (6.5, 2.9), clean = False, show = False)
+    ead_map_plot(ead_gdf, (6.5, 2.9), clean = True, show = False)
+
+    # --- EAD x DISTANCE (by BID) ---
+    # Plot
+    data = pl.from_pandas(ead_gdf.drop(columns=["geometry"], errors="ignore"))
+    def ead_dist_plot(data, figsize, clean: bool, show: bool, highlight: dict | None = None):
+        # Convert GeoDataFrame to Polars DataFrame (ignoring spatial geometry for plotting)
+        with plt.rc_context(custom_style):  # type: ignore
+            # FIG
+            fig, ax = _init_fig(figsize, clean)
+
+            # Filter data into zero and positive values
+            col = "ead_q50_c_sum"
+            data_zero = data.filter(pl.col(col) == 0)
+            data_pos = data.filter(pl.col(col) > 0)
+
+            # Normaliation
+            q50_pos = data_pos[col].to_numpy()
+            vmin = float(np.percentile(q50_pos, 5))
+            vcenter = float(np.percentile(q50_pos, 50))
+            vmax = float(np.percentile(q50_pos, 95))
+            if vmin >= vcenter:
+                vmin = vcenter - 0.1
+            if vmax <= vcenter:
+                vmax = vcenter + 0.1
+            norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=vcenter, vmax=vmax)
+
+            # PLOT
+            ax.scatter(
+                data_zero["NEAR_DIST"].to_numpy(),
+                data_zero[col].to_numpy(),
+                color="white",
+                edgecolor="none",
+                s=12,
+                zorder=2,
+            )
+
+            # HIGHLIGHT CONTOUR LAYER
+            if not data_pos.is_empty():
+                ax.scatter(
+                    data_pos["NEAR_DIST"].to_numpy(),
+                    data_pos[col].to_numpy(),
+                    c=data_pos[col].to_numpy(),
+                    cmap="YlOrRd",
+                    norm=norm,
+                    edgecolor="none",
+                    linewidth=0,
+                    s=25,
+                    zorder=3,
+                )
+            
+            hl_mask = _get_highlight_mask(data, highlight)
+            if hl_mask is not None and hl_mask.any():
+                data_hl = data.filter(hl_mask)
+                if not data_hl.is_empty():
+                    ax.scatter(
+                        data_hl["NEAR_DIST"].to_numpy(),
+                        data_hl[col].to_numpy(),
+                        facecolor="none",
+                        edgecolor="blue",
+                        linewidth=1.5,
+                        s=35,
+                        zorder=4,
+                    )
+                
+            # STYLE
+            plt.grid(True, linestyle="--", alpha=0.5)
+            
+            
+            ax.yaxis.set_major_locator(ticker.SymmetricalLogLocator(base=10, linthresh=10))
+            ax.yaxis.set_minor_locator(
+                ticker.SymmetricalLogLocator(
+                    base=10, 
+                    linthresh=10, 
+                    subs=np.arange(2, 10) # type: ignore
+                )
+            )
+            ax.tick_params(axis='y', which='minor', left=True, right=False)
+            
+            ax.set_ylim(bottom=0)
+            ax.set_xlim(left=0)
+            
+            if not clean:
+                ax.set(
+                    xlabel="Near Distance (m)",
+                    ylabel="Expected Annual Damage (€)",
+                    title="EAD vs Distance",
+                )
+
+                # Colorbar 
+                sm = cm.ScalarMappable(cmap="YlOrRd", norm=norm)
+                sm.set_array([])
+                cbar = fig.colorbar(sm, ax=ax)
+                cbar_ticks = [vmin, vcenter, vmax]
+                cbar.set_ticks(cbar_ticks)
+                cbar.set_ticklabels([f"€{t:.1f}" for t in cbar_ticks])
+                cbar.set_label("Damage Intensity (€)", rotation=270, labelpad=15)
+            else:
+                ax.set(
+                    xticklabels=[],
+                    yticklabels=[],
+                )
+                ax.tick_params(axis="x", which="minor", bottom=False)
+            
+            # SAVE
+            base_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\postprocessor\damage\F9_EADDist"
+            clean_suffix = "_clean.png" if clean else ".png"
+            png_path = f"{base_path}{clean_suffix}"
+
+            _savefig(fig, png_path, clean, show)
+    ead_dist_plot(data, (6.5, 1.8), clean = False, show = False)
+    ead_dist_plot(data, (6.5, 1.8), clean = True, show = False)
+
+    data_df = (
+        data
+        .select("NEAR_DIST", "ead_q50_c_sum")
+        .filter((pl.col("NEAR_DIST") < 19, pl.col("ead_q50_c_sum") > 600))
+    )
+    # endregion
+
+    # HERE ------------------------------
+    # region 2.6 SHAP (Figure 10)
+    # ------------------------------
+    # Prepare raw data
+    sample_file = os.path.join(gsa_dir, f"shap_rp_{next(iter(RETURN_PERIODS))}.ipc")
+    available_cols = set(pl.read_ipc_schema(sample_file).keys())
+    shap_groups = [g for g in color_dic["shap_groups"].keys() if g in available_cols]
+
+    # --- EAS (Expected Annual SHAP, Municipality) ---
+    # expected_annual_shap_groups_municipality
+    results.add_result(
+        res_name="expected_annual_shap_groups_municipality",
+        res_description="""Expected Annual SHAP (EAS) by group at municipality level with percentage contributions""",
+        data=(
+            pl.concat([
+                pl.read_ipc(os.path.join(gsa_dir, f"shap_rp_{rp}.ipc"))
+                .with_columns(pl.lit(rp).cast(pl.Int64).alias("RP"))
+                for rp in RETURN_PERIODS.keys()
+            ])
+            .group_by("RP")
+            .agg([pl.col(group).abs().mean().cast(pl.Float64).alias(group) for group in shap_groups])
+            .pipe(
+                lambda df: pl.concat([
+                    pl.DataFrame({
+                        "RP": [2],
+                        **{group: [0.0] for group in shap_groups},
+                    }).select(df.columns),
+                    df.filter(pl.col("RP") != 2),
+                ])
+            )
+            .with_columns((1 / pl.col("RP")).alias("p"))
+            .sort("RP")
+            .select([
+                (
+                    0.5 * (pl.col(group) + pl.col(group).shift(-1)) * 
+                    (pl.col("p") - pl.col("p").shift(-1))
+                ).sum().alias(group)
+                for group in shap_groups
+            ])
+            .unpivot(on=shap_groups, variable_name="group", value_name="value")
+            .with_columns(
+                pct=(pl.col("value") / pl.col("value").sum()) * 100
+            )
+            .sort("value", descending=True)
+        ),
+        overwrite=True,
+    )
+
+    # Plot
+    eas_data = results.get_result_as_df(res_name="expected_annual_shap_groups_municipality")
+    def eas_shap_plot_1(data: pl.DataFrame, figsize, clean: bool, show: bool, group_labels: dict | None = None):
+        # Ensure dataset is sorted descending by value
+        df_plot = data.sort("value", descending=True)
+        n_groups = len(df_plot)
+        y_pos = np.arange(n_groups)
+
+        with plt.rc_context(custom_style):  # type: ignore
+            # FIG
+            fig, ax = _init_fig(figsize, clean)
+
+            # PLOT
+            for i, row in enumerate(df_plot.to_dicts()):
+                grp = row["group"]
+                val = row["value"]
+                pct = row["pct"]
+                color = color_dic["shap_groups"].get(grp, "#333333")
+                label_text = group_labels.get(grp, str(grp)) if group_labels else str(grp)
+
+                # Horizontal bar
+                ax.barh(
+                    y=i,
+                    width=val,
+                    left=0,
+                    height=0.75,
+                    color=color,
+                    edgecolor="none",
+                    zorder=2,
+                    label=label_text
+                )
+                
+                # Pct
+                if not clean:
+                    ax.text(
+                        x= 0.0001 * 1.2,
+                        y=i,
+                        s=f"{pct:.2f} %",
+                        va="center",
+                        ha="left",
+                        fontsize=8,
+                        zorder=3
+                    )
+                
+            # STYLE
+            ax.invert_yaxis()
+            ax.grid(True, axis="x", which="both", linestyle=":", linewidth=0.6, color="#bbb8b8", alpha=0.7, zorder=1)
+            ax.set_axisbelow(True)
+            
+            ax.set_xscale("log")
+            ax.set_xlim(0.0001, 1)
+
+            ax.xaxis.set_major_locator(ticker.LogLocator(base=10.0, numticks=10))
+            ax.xaxis.set_minor_locator(ticker.LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1, numticks=10)) # type: ignore
+            
+            ax.set(yticks=y_pos)
+            
+            if not clean:
+                ax.set(
+                    xlabel=r"Expected Annual |SHAP| (log(€/year))",
+                    ylabel="Grouped Input Uncertainty",
+                    yticks=y_pos,
+                    yticklabels=[f"C{i+1}" for i in range(n_groups)],
+                )
+                
+                ax.legend(
+                    loc="upper left",
+                    bbox_to_anchor=(1.04, 1.0),
+                    fontsize=6,
+                    framealpha=0.9,
+                    borderaxespad=0,
+                )
+            else:
+                ax.set(
+                    xticklabels=[],
+                    yticklabels=[]
+                )
+                ax.tick_params(axis="y", which="minor", left=False)
+
+            # SAVE
+            png_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\postprocessor\gsa\F10_ExpectedAnnualSHAP"
+            png_path = png_path + ".png" if not clean else png_path + "_clean.png"
+            _savefig(fig, png_path, clean, show)
+    eas_shap_plot_1(eas_data, figsize=(2.8, 3.1), clean=False, show=False)
+    eas_shap_plot_1(eas_data, figsize=(2.8, 3.1), clean=True, show=False)
+
+    # --- SHAP (by RP) ---
+    # shap_groups_municipality_by_rp
+    results.add_result(
+        res_name="shap_groups_municipality_by_rp",
+        res_description="""Absolute mean SHAP values by group at municipality level for each return period with percentage contributions""",
+        data=(
+            pl.concat([
+                pl.read_ipc(os.path.join(gsa_dir, f"shap_rp_{rp}.ipc"))
+                .with_columns(pl.lit(rp).cast(pl.Int64).alias("RP"))
+                for rp in RETURN_PERIODS.keys()
+            ])
+            .group_by("RP")
+            .agg([pl.col(group).abs().mean().cast(pl.Float64).alias(group) for group in shap_groups])
+            .with_columns(
+                pl.sum_horizontal(shap_groups).alias("total_shap")
+            )
+            .with_columns([
+                # Create the _pct columns relative to that RP's total
+                ((pl.col(group) / pl.col("total_shap")) * 100).alias(f"{group}_pct")
+                for group in shap_groups
+            ])
+            .drop("total_shap")
+            .sort("RP")
+        ),
+        overwrite=True,
+    )
+
+    # Plot
+    shap_groups_municipality_by_rp = results.get_result_as_df(res_name="shap_groups_municipality_by_rp")
+    def shap_plot_2(data: pl.DataFrame, figsize, clean: bool, show: bool, group_labels: dict | None = None):
+        # Extract RPs for the x-axis mapping
+        rps = data["RP"].to_list()
+        x_pos = np.arange(len(rps))
+        
+        # Identify all percentage columns
+        pct_cols = [c for c in data.columns if c.endswith("_pct")]
+        groups = [c.replace("_pct", "") for c in pct_cols]
+        
+        with plt.rc_context(custom_style):  # type: ignore
+            # FIG
+            fig, ax = _init_fig(figsize, clean)
+            
+            # PLOT
+            for grp in groups:
+                y = data[f"{grp}_pct"].to_numpy()
+                
+                color = color_dic["shap_groups"].get(grp, "#333333")
+                label_text = group_labels.get(grp, str(grp)) if group_labels else str(grp)
+                
+                ax.plot(
+                    x_pos, 
+                    y, 
+                    color=color, 
+                    marker='o', 
+                    markersize=2, 
+                    linewidth=1.0, 
+                    label=label_text,
+                    zorder=3
+                )
+                
+            # STYLE
+            ax.set_yscale("symlog", linthresh=0.01, linscale=0.3, base=10)
+            ax.set_ylim(0, 100)
+            
+            y_ticks = [0, 0.01, 0.1, 1, 10, 100]
+            ax.set_yticks(y_ticks)
+            
+            ax.yaxis.set_minor_locator(
+                ticker.SymmetricalLogLocator(
+                    base=10, 
+                    linthresh=0.01, 
+                    subs=np.arange(2, 10) # type: ignore
+                )
+            )
+            
+            ax.set_xticks(x_pos)
+            
+            ax.tick_params(axis='x', which='minor', bottom=False, top=False)
+            ax.tick_params(axis='y', which='minor', left=True, right=False)
+            
+            if not clean:
+                # Custom formatting to prevent '10^1' default symlog string formats
+                ax.set_yticklabels([f"{t:g}" for t in y_ticks])
+                ax.set_xticklabels(rps)
+                ax.set(
+                    xlabel="Return Period (year)",
+                    ylabel="Relative total |SHAP| contribution (%)"
+                )
+                
+                # External legend
+                ax.legend(
+                    loc="upper left",
+                    bbox_to_anchor=(1.04, 1.0),
+                    fontsize=8,
+                    framealpha=0.9,
+                    borderaxespad=0,
+                )
+            else:
+                ax.set_xticklabels([])
+                ax.set_yticklabels([])
+                ax.tick_params(axis="x", which="minor", left=False)
+
+            # SAVE
+            base_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\postprocessor\gsa\F10_SHAP_Evolution"
+            png_path = base_path + "_clean.png" if clean else base_path + ".png"
+            _savefig(fig, png_path, clean, show)
+    shap_plot_2(shap_groups_municipality_by_rp, figsize=(2.8, 3.1), clean=False, show=False)
+    shap_plot_2(shap_groups_municipality_by_rp, figsize=(2.8, 3.1), clean=True, show=False)
+
+    # --- EAS (Expected Annual SHAP, BID) ---
+    # expected_annual_shap_groups_bid
+    results.add_result(
+        res_name="expected_annual_shap_groups_bid",
+        res_description="""Expected Annual SHAP (EAS) by group at BID level for each building with percentage contributions""",
+        data=(
+            pl.concat([
+                pl.read_ipc(os.path.join(gsa_dir, f"shap_rp_{rp}.ipc"))
+                .group_by("BID")
+                .agg([pl.col(group).abs().mean().cast(pl.Float64).alias(group) for group in shap_groups])
+                .with_columns(pl.lit(rp).cast(pl.Int64).alias("RP"))
+                for rp in RETURN_PERIODS.keys()
+            ])
+            .pipe(
+                lambda df: pl.concat([
+                    # Get unique BIDs, add RP=2 and 0.0 for all SHAP groups
+                    df.select("BID").unique().with_columns([
+                        pl.lit(2).cast(pl.Int64).alias("RP"),
+                        *[pl.lit(0.0).alias(group) for group in shap_groups]
+                    ]).select(df.columns),
+                    df.filter(pl.col("RP") != 2),
+                ])
+            )
+            .with_columns((1 / pl.col("RP")).alias("p"))
+            .sort(["BID", "RP"])
+            .group_by("BID")
+            .agg([
+                # Calculate Expected Annual SHAP (trapezoidal integration) per BID
+                (
+                    0.5 * (pl.col(group) + pl.col(group).shift(-1)) * 
+                    (pl.col("p") - pl.col("p").shift(-1))
+                ).sum().alias(group)
+                for group in shap_groups
+            ])
+            .with_columns(
+                # Calculate the sum of all absolute EAS means for the current BID
+                pl.sum_horizontal(shap_groups).alias("total_eas")
+            )
+            .with_columns([
+                # Create the _pct columns relative to that BID's total EAS (safeguard against division by zero)
+                pl.when(pl.col("total_eas") > 0)
+                .then((pl.col(group) / pl.col("total_eas")) * 100)
+                .otherwise(0.0)
+                .alias(f"{group}_pct")
+                for group in shap_groups
+            ])
+            .drop("total_eas")
+            .sort("BID")
+        ),
+        overwrite=True,
+    )
+
+    # --- EAS RANK (BID, Rank first 4th) ---
+    # expected_annual_shap_groups_bid_rank
+    expected_annual_shap_groups_bid = results.get_result_as_df(res_name="expected_annual_shap_groups_bid")
+    results.add_result(
+        res_name="expected_annual_shap_groups_bid_rank",
+        res_description="EAS at BID level with top 4 ranked SHAP groups concatenated and their dominance percentage",
+        data=(
+            expected_annual_shap_groups_bid.join(
+                expected_annual_shap_groups_bid
+                .select(["BID"] + shap_groups)
+                .unpivot(index="BID", on=shap_groups, variable_name="group", value_name="eas_value")
+                .sort(["BID", "eas_value"], descending=[False, True])
+                .with_columns([
+                    pl.int_range(1, pl.len() + 1).over("BID").alias("rank_num"),
+                    pl.col("eas_value").sum().over("BID").alias("total_eas")  # Calculate total before filtering
+                ])
+                .filter(pl.col("rank_num") <= 3)
+                .group_by("BID")
+                .agg([
+                    pl.col("group").str.join(">").alias("rank"),
+                    # Calculate % explained by the top 4, safeguarding against division by zero
+                    pl.when(pl.col("total_eas").first() > 0)
+                    .then((pl.col("eas_value").sum() / pl.col("total_eas").first()) * 100)
+                    .otherwise(0.0)
+                    .alias("top4_explained_pct")
+                ])
+                .with_columns([
+                    (pl.len().over("rank") / expected_annual_shap_groups_bid.height * 100).alias("rank_pct")
+                ]),
+                on="BID",
+                how="left"
+            )
+        ),
+        overwrite=True,
+    )
+
+    # Plot
+    expected_annual_shap_groups_bid_rank = results.get_result_as_df(res_name="expected_annual_shap_groups_bid_rank")
+    rank_summary_table = (
+        expected_annual_shap_groups_bid_rank
+        .group_by(["rank", "rank_pct"])
+        .agg(
+            pl.col("top4_explained_pct").min().alias("mean_top4_explained_pct")
+        )
+        .sort("rank_pct", descending=True)
+    )
+    with pl.Config(fmt_str_lengths=150, tbl_rows=-1):
+        print(rank_summary_table)
+    rank_gdf = raw_gdf.merge(
+        expected_annual_shap_groups_bid_rank.to_pandas(),
+        on="BID",
+        how="inner"
+    )
+
+    def rank_map_plot(gdf_data, figsize, clean: bool, show: bool):
+        # WMS request setup
+        wms_url = "https://www.ign.es/wms-inspire/pnoa-ma?request=GetCapabilities&service=WMS"
+        wms = WebMapService(wms_url, version="1.1.1")
+        xmin, ymin, xmax, ymax = gdf_data.total_bounds
+        x_pad = (xmax - xmin) * 0.05 if xmax != xmin else 0.01
+        y_pad = (ymax - ymin) * 0.05 if ymax != ymin else 0.01
+        xmin, xmax = xmin - x_pad, xmax + x_pad
+        ymin, ymax = ymin - y_pad, ymax + y_pad
+        extent = [xmin, xmax, ymin, ymax]
+        bbox = (extent[0], extent[2], extent[1], extent[3])
+        
+        img_request = wms.getmap(
+            layers=["OI.OrthoimageCoverage"],
+            srs="EPSG:4326",
+            bbox=bbox,
+            size=(1000, 1000),
+            format="image/png",
+            transparent=True
+        )
+        img_data = mpimg.imread(BytesIO(img_request.read()))
+        
+        clip_xmin, clip_ymin, clip_xmax, clip_ymax = gdf_data.total_bounds
+        
+        # Identify unique categories and create a desaturated color palette
+        unique_ranks = gdf_data["rank"].dropna().unique().tolist()
+        cmap = plt.get_cmap("Set3")
+        rank_colors = {rank: cmap(i % cmap.N) for i, rank in enumerate(unique_ranks)}
+        
+        chart_style = {
+            **custom_style,
+            "xtick.top": True,
+            "xtick.bottom": False,
+            "xtick.labeltop": True,
+            "xtick.labelbottom": False,
+        }
+        
+        with plt.rc_context(chart_style):  # type: ignore
+            # FIG
+            fig, ax = _init_fig(figsize, clean)
+
+            # PLOT Geometries grouped by rank
+            for rank_val in unique_ranks:
+                subset = gdf_data[gdf_data["rank"] == rank_val]
+                subset.plot(
+                    ax=ax,
+                    color=rank_colors[rank_val],
+                    markersize=9,
+                    edgecolor="black",
+                    linewidth=0.1,
+                    label=rank_val,
+                    zorder=3,
+                )
+            # WMS Background
+            ax.imshow(
+                img_data, 
+                extent=extent, # type: ignore
+                origin="upper", 
+                alpha=1.0, 
+                zorder=0
+            )
+            
+            # STYLE
+            plt.grid(True, linestyle="--", alpha=0.5)
+            ax.set_xlim(clip_xmin, clip_xmax)
+            ax.set_ylim(clip_ymin, clip_ymax)
+            ax.set_aspect("equal", adjustable="box")
+            
+            if not clean:
+                ax.set(
+                    xlabel="Longitude",
+                    ylabel="Latitude",
+                    title="EAS Dominance Rank Map (WGS 84 / EPSG:4326)",
+                )
+                
+                # Format labels
+                ax.xaxis.set_major_formatter(FuncFormatter(_to_dms))
+                ax.yaxis.set_major_formatter(FuncFormatter(_to_dms))
+                
+                # Categorical Legend (replaces colorbar)
+                ax.legend(
+                    title="Top 4 SHAP Rank",
+                    loc="center left", 
+                    bbox_to_anchor=(1.02, 0.5), 
+                    fontsize=7,
+                    title_fontsize=8,
+                    framealpha=0.9,
+                    edgecolor="black"
+                )
+                
+                # Graphic scale
+                center_lat = (ymin + ymax) / 2.0
+                dx_meters = 111_320 * np.cos(np.radians(center_lat))
+                scalebar = ScaleBar(
+                    dx=dx_meters,
+                    units="m",
+                    dimension="si-length",
+                    location="lower left",
+                    box_alpha=0.7,
+                    box_color="white",
+                    color="black",
+                    scale_loc="bottom",
+                    length_fraction=0.2,
+                )
+                ax.add_artist(scalebar)
+                
+            else:
+                ax.set(
+                    xticklabels=[],
+                    yticklabels=[],
+                )
+            
+            # SAVE
+            base_path = r"C:\Users\outal\GITHUB\InDepthPROFILE\data\mocaloss\postprocessor\gsa\F10_SHAPRankMap"
+            clean_suffix = "_clean.png" if clean else ".png"
+            png_path = f"{base_path}{clean_suffix}"
+
+            _savefig(fig, png_path, clean, show)
+    rank_map_plot(rank_gdf, (6.5, 2.9), clean=False, show=False)
+    rank_map_plot(rank_gdf, (6.5, 2.9), clean=True, show=False)
+
+    # endregion
+
+    # Final export
+    results.export_res_to_xlsx()
+
+## FINISH HELPERS
+pl.Config.set_tbl_rows(10)
+pl.Config.set_tbl_cols(10)
+def summary(data_to_summarize, col):
+    df_summary = (
+        data_to_summarize
+        .group_by("RP")
+        .agg([
+            pl.len().alias("count"),
+            #pl.col(col).mean().alias("mean"),
+            #pl.col(col).std().alias("std"),
+            pl.col(col).min().alias("min"),
+            #pl.col(col).quantile(0.01).alias("q01"),
+            pl.col(col).quantile(0.05).alias("q05"),
+            pl.col(col).median().alias("q50"),
+            pl.col(col).quantile(0.95).alias("q95"),
+            #pl.col(col).quantile(0.99).alias("q99"),
+            pl.col(col).max().alias("max"),
+        ])
+        .sort("RP", descending=True)
+    )
+    pl.Config.set_tbl_cols(-1)
+    print(df_summary)
+
+
+
+

@@ -59,7 +59,7 @@ PATHS = {
     
     # NEW! mocaloss
     'mocaloss_working_dir' : DATA_DIR / 'mocaloss',
-    'sampling_rules_name' : "sampling_table_v1.4.pkl",
+    'sampling_rules_name' : "sampling_table_v1.7.pkl",
     
     # NEW! Official floods
     'det_RP10' : DATA_DIR / 'inputs' / "gis" / "OficialFloods" / "Q10_2Ciclo_PB_2026_Navaluenga.shp",
